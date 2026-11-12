@@ -25,7 +25,7 @@ VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".mts", ".3gp"}
 OUTPUT = "template_reel_output"  # Save reel writes here, inside the footage folder; never searched for footage
 # cuts: a colour-grid jump (mean 8x8 change > 12, and 3x the median of 8 frames either side), PySceneDetect content (27), or a wipe
 # (a frame with 20+ pixels 40 off its median grey at 144x256, then 2 nearly blank frames: typed text cleared); 1 frame apart = one cut
-CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_threshold": 27.0, "wipe_detail": 40, "wipe_min_px": 20, "wipe_blank_px": 5, "merge_frames": 1}
+CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_threshold": 27.0, "wipe_detail": 40, "wipe_min_px": 20, "wipe_blank_px": 5, "merge_frames": 1, "min_shot_s": 0.5}
 DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/heads/master.zip", "https://github.com/QualityAssessment/DOVER/releases/download/"  # S-Lab licence: non-commercial
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
 LOCK, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), {}, {}, {}
@@ -72,7 +72,7 @@ def describe(path):  # a video as seen: rotation and pixel aspect applied; fps, 
     n, _, d = str(v.get("sample_aspect_ratio", "")).partition(":"); sar = float(n) / float(d) if d and float(n) > 0 and float(d) > 0 else 1.0
     w, h = int(v["width"]), int(v["height"]); stored, w = [w, h], round(w * sar); w, h = (h, w) if rot % 180 else (w, h)
     r, avg = fraction(v.get("r_frame_rate")), fraction(v.get("avg_frame_rate"))
-    return {"display_size": [w, h], "stored_size": stored, "sar": round(sar, 4), "fps": round(avg or r, 3), "transfer": v.get("color_transfer"),
+    return {"display_size": [w, h], "stored_size": stored, "sar": round(sar, 4), "fps": round(avg or r, 3), "transfer": v.get("color_transfer"), "codec": v.get("codec_name"), "pix_fmt": v.get("pix_fmt"),
             "duration_s": round(float(v.get("duration") or info["format"].get("duration") or 0), 3), "hdr": v.get("color_transfer") in ("arib-std-b67", "smpte2084")}
 
 
@@ -134,24 +134,31 @@ def cuts(video):  # three detectors: colour-grid jump, PySceneDetect content, wi
     for grp in groups:
         by = sorted({k for k, s in found.items() for i in grp if i in s}); frame = next((i for i in grp if i in found["grid"] | found["wipe"]), grp[0])
         out.append({"frame": frame, "t": round(frame / fps, 3), "sure": len(by) > 1 or "wipe" in by, "by": by})
-    edges = [0, *(k["frame"] for k in out), len(grid)]; return {"video": Path(video).name, "fps": fps, "frames": len(grid), "cuts": out, "shots": [{"start_f": s, "end_f": e, "len_s": round((e - s) / fps, 3)} for s, e in zip(edges, edges[1:])]}
+    floor_f = round(c["min_shot_s"] * fps)  # coalesce shots shorter than min_shot_s by dropping the less confident of the two bounding cuts (tie -> drop the right)
+    while True:
+        edges = [0, *(k["frame"] for k in out), len(grid)]
+        b = next((i for i in range(len(edges) - 1) if edges[i + 1] - edges[i] < floor_f), None)
+        if b is None or not out: break
+        out.pop(b - 1 if b == len(out) or (b > 0 and not out[b - 1]["sure"] and out[b]["sure"]) else b)
+    return {"video": Path(video).name, "fps": fps, "frames": len(grid), "min_shot_s": c["min_shot_s"], "cuts": out, "shots": [{"start_f": s, "end_f": e, "len_s": round((e - s) / fps, 3)} for s, e in zip(edges, edges[1:])]}
 
 
-def template(link):  # the template folder + its cuts (detected again only if the video is newer)
+def template(link):  # the template folder + its cuts (detected again if the video or this script is newer, so CUT config changes bust the cache)
     with LOCK:
         d = fetch(link); cj = d / "cuts.json"
-        if not cj.exists() or cj.stat().st_mtime < (d / "video.mp4").stat().st_mtime: cj.write_text(json.dumps(cuts(d / "video.mp4"), indent=1))
+        if not cj.exists() or cj.stat().st_mtime < max((d / "video.mp4").stat().st_mtime, Path(__file__).stat().st_mtime): cj.write_text(json.dumps(cuts(d / "video.mp4"), indent=1))
         return d, json.loads(cj.read_text())
 
 
 # ---------------------------------------------------------------- scoring models
-class Reader:  # a clip's frames for scoring: 30 fps, 540x960, the reel's 9:16 crop. OpenCV in-process (an ffmpeg launch costs ~5 s); ffmpeg for HDR
+class Reader:  # a clip's frames for scoring: 30 fps, 540x960, the reel's 9:16 crop. OpenCV in-process (an ffmpeg launch costs ~5 s); ffmpeg for HDR + HEVC (cv2's swscale on macOS can't convert 10-bit HEVC mid-stream)
     def __init__(self, video, meta):
         import cv2
-        self.video, self.meta, self.cap = video, meta, None if meta["hdr"] else cv2.VideoCapture(str(video))
+        self.video, self.meta, self.cap = video, meta, None if meta["hdr"] or meta.get("codec") == "hevc" else cv2.VideoCapture(str(video))
         ok, f = self.cap.read() if self.cap is not None and self.cap.isOpened() else (False, None); (dw, dh), (sw, sh) = meta["display_size"], meta["stored_size"]
-        if not ok or ((f.shape[1] > f.shape[0]) != (dw > dh) and dw != dh and sw != sh): self.cap = None  # OpenCV turns rotated video itself; if not, ffmpeg decodes
+        if not ok or ((f.shape[1] > f.shape[0]) != (dw > dh) and dw != dh and sw != sh): self.cap and self.cap.release(); self.cap = None  # OpenCV turns rotated video itself; if not, ffmpeg decodes (release the failed cap so its ffmpeg threads go)
         self.fps = (self.cap.get(cv2.CAP_PROP_FPS) if self.cap else 0) or meta["fps"] or 30.0
+        print(f"reader: {Path(video).name} codec={meta.get('codec')} pix_fmt={meta.get('pix_fmt')} dur={meta['duration_s']:.1f}s path={'ffmpeg' if self.cap is None else 'cv2'}", flush=True)
 
     def frames(self, start, length, w=540, h=960):
         import cv2
@@ -335,6 +342,7 @@ def models(keys):  # load the ticked scoring models once per process
 
 def rate(v, start, length, keys):  # one try: decode the clip once, every ticked model scores it, equal-weight combined
     t = time.time(); f = S["readers"][v].frames(start, length); note("decode_s", time.time() - t); vals = {}
+    if len(f) <= 1: print(f"rate: {Path(v).name} decoded {len(f)} frame(s) at {start:.2f}s/{length:.2f}s - scoring skipped, score 0", flush=True)
     for k in keys if len(f) > 1 else []:
         t = time.time(); raw = LOADED[k](f); note("try:" + k, time.time() - t)
         vals[k] = round(value(k, raw, stats.get("raw:" + k, [])), 4); note("raw:" + k, raw)
@@ -352,17 +360,18 @@ def probe_video(v):  # a video's meta (None if unreadable), read once
 
 
 def search(vids, length, tries, thr, rnd, label, keys):  # videos in the given order, up to `tries` random starts each
-    best = None
+    best = None; score_len = max(length, 0.5)  # rate() needs >= 2 frames; pad micro-shots (template occasionally yields 1-frame cuts) so scoring sees a real clip. Render still uses the shot's real length.
+    print(f"search: {label} length={length:.2f}s score_len={score_len:.2f}s pool={len(vids)} thr={thr}", flush=True)
     for v in vids:
         m = probe_video(v)
-        if not m or m["duration_s"] < length + 0.2: continue
+        if not m or m["duration_s"] < score_len + 0.2: continue
         for t in range(tries):
-            r = rate(v, rnd.uniform(0, m["duration_s"] - length - 0.1), length, keys)
+            r = rate(v, rnd.uniform(0, m["duration_s"] - score_len - 0.1), score_len, keys)
             busy(f"{label} · {v.name} · try {t + 1}/{tries} · score {r['score']:.2f}")
             if not best or r["score"] > best[1]["score"]: best = (v, r)
             if r["score"] >= thr: break
         if best and best[1]["score"] >= thr: break
-    if not best: raise RuntimeError(f"no usable video longer than {length:.2f} s")
+    if not best: raise RuntimeError(f"no usable video longer than {score_len:.2f} s")
     return {"src": str(best[0]), **best[1], "low": best[1]["score"] < thr}
 
 
@@ -388,6 +397,8 @@ def build(link, folder, tries, threshold, keys=("current",), seed=None):
     if not pool: raise RuntimeError(f"no videos in {folder}")
     keys = models(list(keys)); rnd = random.Random(seed); plan = []
     for k, s in enumerate(T["shots"]):
+        for r in S["readers"].values(): r.cap and r.cap.release()  # previous shot's cv2 caps hold ffmpeg decoder threads; free them before this shot's search probes fresh videos
+        S["readers"].clear(); S["metas"].clear()
         plan.append({**s, **search(order(pool, rnd), (s["end_f"] - s["start_f"]) / T["fps"], tries, threshold, rnd, f"Shot {k + 1} of {len(T['shots'])}", keys)})
     busy("Rendering"); out = d / f"reel_{stamp()}.mp4"; render(plan, T["fps"], out, d / "audio.wav")
     url = publish(d, {**T, "video": out.name, "shots": plan, "template": d.name, "folder": str(folder), "tries": tries, "threshold": threshold, "models": keys}, out)
@@ -399,22 +410,42 @@ def editing(reel):  # the reel being edited (its .json is reloaded after a resta
     return S["data"], S["dir"]
 
 
-def replace(reel, i, mode, path="", seed=None):  # a new clip for shot i -> previewed, not yet kept
+def replace(reel, i, mode, path="", seed=None):  # 5 delta-stratified candidates for shot i: same = 5 moments in one video; random = 5 videos across ordering
+    for r in S["readers"].values(): r.cap and r.cap.release()  # the previous replace's cv2 caps hold ffmpeg decoder threads; free them before probing fresh videos
+    S["readers"].clear(); S["metas"].clear()
     data, d = editing(reel); s = data["shots"][i]; rnd = random.Random(seed); fps = data["fps"]
-    if mode == "same": vids = [Path(s["src"])]  # the video of the shot's current clip
-    elif mode == "path":
-        vids = [Path(path.strip().strip('"'))]
-        if not vids[0].is_file(): raise RuntimeError(f"not a video file: {vids[0]}")
-    else: vids = order(videos(data["folder"]), rnd)
-    keys = models(data.get("models", ["current"]))
-    c = {**s, **search(vids, (s["end_f"] - s["start_f"]) / fps, data.get("tries", TRIES), data["threshold"], rnd, f"Shot {i + 1}", keys)}
-    busy("Making the preview"); (d / "previews").mkdir(exist_ok=True); out = d / "previews" / f"shot{i + 1}_{stamp()}.mp4"
-    render([c], fps, out, d / "audio.wav", s["start_f"] / fps); c["preview"] = f"/t/{d.name}/previews/{out.name}"
-    S["pending"] = (reel, i, c); state.update(stage="preview", reel=reel, shot=i, cand=c, msg=""); save_stats(); return c
+    L = (s["end_f"] - s["start_f"]) / fps; tries, thr = data.get("tries", TRIES), data["threshold"]
+    keys = models(data.get("models", ["current"])); cands = []
+    if mode == "path":
+        p = Path(path.strip().strip('"'))
+        if not p.is_file(): raise RuntimeError(f"not a video file: {p}")
+        cands.append({**s, **search([p], L, tries, thr, rnd, f"Shot {i + 1}", keys)})
+    elif mode == "same":
+        v = Path(path.strip().strip('"')) if path else Path(s["src"]); m = probe_video(v)
+        if not m: raise RuntimeError(f"cannot probe {v}")
+        D = m["duration_s"]; dt = rnd.uniform(0, 0.2 * D)
+        for k in range(5):
+            start = max(0.0, min(D - L - 0.1, 0.2 * k * D + dt)); r = rate(v, start, L, keys)
+            busy(f"Shot {i + 1} · tab {k + 1}/5 · score {r['score']:.2f}")
+            cands.append({**s, "src": str(v), **r, "low": r["score"] < thr})
+    else:
+        pool = videos(data["folder"]); n = len(pool); dt = rnd.uniform(0, 0.2)
+        for k in range(min(5, n)):
+            lo, hi = int(0.2 * k * n), min(n, int(0.2 * (k + 1) * n))
+            if lo >= hi: continue
+            anc = min(int((0.2 * k + dt) * n), hi - 1); vids = [pool[anc], *rnd.sample(pool[lo:anc] + pool[anc + 1:hi], hi - lo - 1)]
+            try: cands.append({**s, **search(vids, L, tries, thr, rnd, f"Shot {i + 1} · tab {k + 1}/5", keys)})
+            except RuntimeError: pass
+    if not cands: raise RuntimeError(f"no usable video longer than {L:.2f} s")
+    (d / "previews").mkdir(exist_ok=True)
+    for k, c in enumerate(cands):
+        busy(f"Rendering {k + 1}/{len(cands)}"); out = d / "previews" / f"shot{i + 1}_tab{k + 1}_{stamp()}.mp4"
+        render([c], fps, out, d / "audio.wav", s["start_f"] / fps); c["preview"] = f"/t/{d.name}/previews/{out.name}"
+    S["pending"] = (reel, i, cands); state.update(stage="preview", reel=reel, shot=i, cands=cands, msg=""); save_stats(); return cands
 
 
-def keep():  # the previewed clip becomes the shot's clip, and the reel is re-rendered with it right away
-    reel, i, c = S.pop("pending"); data, d = editing(reel); data["shots"][i] = {k: x for k, x in c.items() if k != "preview"}; return save(reel)
+def keep(tab=0):  # the selected tab's clip becomes the shot's clip, and the reel is re-rendered with it right away
+    reel, i, cs = S.pop("pending"); data, d = editing(reel); data["shots"][i] = {k: x for k, x in cs[tab].items() if k != "preview"}; return save(reel)
 
 
 def save(reel):  # a new version of the reel (earlier versions are kept)
@@ -463,7 +494,7 @@ class H(SimpleHTTPRequestHandler):
         if route == "/keep" and "pending" not in S: return self.reply({"error": "nothing to keep"})
         job = {"/start": lambda: build(a["link"].strip(), Path(a["folder"].strip().strip('"')), int(a["tries"]), float(a["threshold"]),
                                        [k for k in a.get("models", ["current"]) if k in MODELS] or ["current"]),
-               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", "")), "/keep": keep, "/export": lambda: export(a["reel"])}[route]
+               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", "")), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"])}[route]
         def run():
             try: job()
             except Exception as e: traceback.print_exc(); state.update(stage="error", msg=last(e))
@@ -555,6 +586,7 @@ body{margin:0;font:14px system-ui,sans-serif;background:#111;color:#eee;display:
 button.hot{background:linear-gradient(90deg,#f5b041,#e67e22);color:#111;border-color:transparent;font-weight:600} #edit input{background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:12px;padding:3px 10px;font-size:12px;width:280px}
 #info{color:#888;width:100%;text-align:center} #info .q,.cap .q{color:#e74c3c} #msg{color:#aaa} #stage{flex:1;min-height:0;display:flex;gap:16px;justify-content:center} .cap{font-size:12px;color:#aaa;display:flex;gap:8px;align-items:center} .cap b{color:#eee} #R .cap b{color:#f5b041}
 figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px} figure video{flex:1;min-height:0;width:100%;object-fit:contain}
+#tabs{display:flex;gap:4px;flex:none} .tab{padding:2px 10px;background:#1b1b1b;border:1px solid #333;border-radius:10px;cursor:pointer;font-size:11px;color:#aaa} .tab:hover{background:#2a2a2a} .tab.on{background:#e67e22;color:#111;border-color:transparent} .tab .lo{color:#e74c3c}
 </style>
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
@@ -567,7 +599,7 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 <div id="stage"><figure id="L"><div class="cap" hidden><b>Current</b><span id="lcap"></span><button id="lplay">▶ Play</button><label><input type="checkbox" id="lloop"> Loop</label></div>
   <video id="player" playsinline></video></figure>
   <figure id="R" hidden><div class="cap"><b>New</b><span id="rcap"></span><button id="rplay">▶ Play</button><label><input type="checkbox" id="rloop"> Loop</label></div>
-  <video id="cand" playsinline></video></figure></div>
+  <div id="tabs"></div><video id="cand" playsinline></video></figure></div>
 <script>
 const D = /*DATA*/null, $ = s => document.querySelector(s), P = $('#player'), Q = $('#cand'), T = f => f / D.fps;
 const fmt = s => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, '0')}`, name = s => s.src.split(/[\\/]/).pop();
@@ -610,10 +642,16 @@ onkeydown = e => { if (e.target.tagName === 'INPUT') return; if (e.key === 'Arro
 // ---- editing: only when the page comes from the server (opened as a file it is view-only)
 const post = (u, b) => fetch(u, {method: 'POST', body: JSON.stringify(b)}).then(r => r.json()), reel = `${D.template}/${D.video}`;
 const ui = (choose, decide, msg = '') => { $('#edit').hidden = !(choose || decide || msg); $('#choose').hidden = !choose; $('#decide').hidden = !decide; $('#msg').textContent = msg; };
-function compare(p) {  // current clip on the left (never touched here), the proposal on the right, paused; null closes the split
+function compare(p) {  // current clip on the left (never touched here), 5 proposals on the right as tabs; null closes the split
   pend = p; $('#R').hidden = !p; $('#L .cap').hidden = !p; if (!p) return Q.removeAttribute('src'), Q.load();
-  const c = p.c; Q.src = c.preview; Q.muted = P.muted; Q.loop = $('#rloop').checked; ui(false, true);
+  $('#tabs').hidden = p.cs.length <= 1; $('#tabs').innerHTML = p.cs.map((c, j) => `<span class="tab" data-i="${j}">${j + 1}${c.low ? '<span class="lo">*</span>' : ''}</span>`).join("");
+  document.querySelectorAll('#tabs .tab').forEach(t => t.onclick = () => { pend.tab = +t.dataset.i; show(); });
+  show(); ui(false, true);
+}
+function show() {
+  const c = pend.cs[pend.tab]; Q.src = c.preview; Q.muted = P.muted; Q.loop = $('#rloop').checked;
   $('#rcap').innerHTML = ` ${name(c)} @ ${fmt(c.start)} · ${c.score.toFixed(2)}${c.low ? ' <span class="q">(low)</span>' : ''}`;
+  document.querySelectorAll('#tabs .tab').forEach((t, j) => t.classList.toggle('on', j === pend.tab));
 }
 $('#rloop').onchange = () => Q.loop = $('#rloop').checked;
 async function wait(done) { const s = await (await fetch('/status')).json();  // follows a replace / keep job on the server
@@ -622,19 +660,19 @@ async function wait(done) { const s = await (await fetch('/status')).json();  //
 function replace(m, path = $('#path').value) { const i = cur, first = !pend;
   if (m === 'path' && !path.trim()) { $('#path').hidden = false; return $('#path').focus(); }
   if (first) { P.pause(); pick(i, false); }  // the left is set once, paused on the shot's first frame; try-agains never touch it
-  post('/replace', {reel, shot: i, mode: m, path}).then(() => wait(s => compare({i, c: s.cand}))); }
+  post('/replace', {reel, shot: i, mode: m, path}).then(() => wait(s => compare({i, cs: s.cands, tab: 0}))); }
 document.querySelectorAll('#choose [data-m]').forEach(b => b.onclick = () => replace(b.dataset.m));
 $('#path').onkeydown = e => e.key === 'Enter' && replace('path');
 $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, false);
-$('#againSame').onclick = () => replace('path', pend.c.src);  // another moment of the proposal's video
+$('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
 $('#export').onclick = () => post('/export', {reel}).then(() => wait(s => ui(false, false, `Saved: ${s.folder}`)));
 $('#cancel').onclick = () => post('/cancel', {}).then(() => { compare(null); ui(false, false); pick(cur); });
-$('#keep').onclick = () => { const i = pend.i; post('/keep', {}).then(() => wait(s => location.href = `${s.url}#shot=${i + 1}`)); };
+$('#keep').onclick = () => { const i = pend.i; post('/keep', {tab: pend.tab}).then(() => wait(s => location.href = `${s.url}#shot=${i + 1}`)); };
 pick((+location.hash.split('shot=')[1] || 1) - 1, false);
 if (location.protocol.startsWith('http') && D.template) { $('#rep').hidden = $('#export').hidden = false;  // after a reload: a proposal still waiting, or a job still running
-  fetch('/status').then(r => r.json()).then(s => s.stage === 'preview' && s.reel === reel ? (pick(s.shot, false), compare({i: s.shot, c: s.cand}))
-    : s.stage === 'working' && wait(s => s.stage === 'preview' ? (pick(s.shot, false), compare({i: s.shot, c: s.cand})) : location.href = s.url)); }
+  fetch('/status').then(r => r.json()).then(s => s.stage === 'preview' && s.reel === reel ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0}))
+    : s.stage === 'working' && wait(s => s.stage === 'preview' ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0})) : location.href = s.url)); }
 </script>
 """
 
