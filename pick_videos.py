@@ -28,7 +28,7 @@ OUTPUT = "template_reel_output"  # Save reel writes here, inside the footage fol
 CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_threshold": 27.0, "wipe_detail": 40, "wipe_min_px": 20, "wipe_blank_px": 5, "merge_frames": 1, "min_shot_s": 0.5}
 DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/heads/master.zip", "https://github.com/QualityAssessment/DOVER/releases/download/"  # S-Lab licence: non-commercial
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
-LOCK, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), {}, {}, {}
+LOCK, SCORE, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), threading.Lock(), {}, {}, {}  # SCORE: one scoring job at a time (Slide's score, a replace)
 THUMBS = CACHE / "thumbs"  # Choose a video's icons: <hash of path+size+mtime>_<duration s>.jpg
 state = {"stage": "setup", "tries": TRIES, "threshold": THRESHOLD, "max_tries": MAX_TRIES}
 S = {"metas": {}, "readers": {}}  # per process: each video's probe + reader, the reel being edited
@@ -335,9 +335,9 @@ def estimate(shots, tries, thr, nv, keys):  # seconds: models' load + expected t
     return {"seconds": round(load_s + shots * vids * per_video * try_s + min(nv, shots * vids) * med("probe_s", 3) + med("render_s", 20)), "rough": rough}
 
 
-def models(keys):  # load the ticked scoring models once per process
+def models(keys, quiet=False):  # load the ticked scoring models once per process
     for k in keys:
-        if k not in LOADED: busy(f"Loading {MODELS[k][0]}"); t = time.time(); LOADED[k] = MODELS[k][7](); note("load:" + k, time.time() - t)
+        if k not in LOADED: quiet or busy(f"Loading {MODELS[k][0]}"); t = time.time(); LOADED[k] = MODELS[k][7](); note("load:" + k, time.time() - t)
     return keys
 
 
@@ -411,7 +411,7 @@ def editing(reel):  # the reel being edited (its .json is reloaded after a resta
     return S["data"], S["dir"]
 
 
-def replace(reel, i, mode, path="", seed=None):  # 5 delta-stratified candidates for shot i: same = 5 moments in one video; random = 5 videos across ordering
+def replace(reel, i, mode, path="", seed=None, start=0.0):  # 5 delta-stratified candidates for shot i: same = 5 moments in one video; random = 5 videos across ordering; slide = the moment you picked
     for r in S["readers"].values(): r.cap and r.cap.release()  # the previous replace's cv2 caps hold ffmpeg decoder threads; free them before probing fresh videos
     S["readers"].clear(); S["metas"].clear()
     data, d = editing(reel); s = data["shots"][i]; rnd = random.Random(seed); fps = data["fps"]
@@ -421,6 +421,8 @@ def replace(reel, i, mode, path="", seed=None):  # 5 delta-stratified candidates
         p = Path(path.strip().strip('"'))
         if not p.is_file(): raise RuntimeError(f"not a video file: {p}")
         cands.append({**s, **search([p], L, tries, thr, rnd, f"Shot {i + 1}", keys)})
+    elif mode == "slide":  # scored for reference only: never marked low
+        v = S["slide"]; probe_video(v); cands.append({**s, "src": str(v), **rate(v, start, max(L, 0.5), keys), "low": False})
     elif mode == "same":
         v = Path(path.strip().strip('"')) if path else Path(s["src"]); m = probe_video(v)
         if not m: raise RuntimeError(f"cannot probe {v}")
@@ -468,6 +470,33 @@ def thumb(p):  # the first frame at 480 px + the length, cached in THUMBS. OpenC
     return tmp.replace(THUMBS / f"{h}_{int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]):.2f}.jpg")
 
 
+def strip(p, n=16):  # Slide's timeline: n frames evenly across the video, centre squares side by side, cached as THUMBS/strip-<hash>_<duration s>.jpg
+    import cv2
+    h = tkey(p); THUMBS.mkdir(parents=True, exist_ok=True)
+    if f := next(THUMBS.glob(f"strip-{h}_*.jpg"), None): return f
+    cap = cv2.VideoCapture(str(p)); fps, N = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT); fs = []
+    for k in range(n if fps > 0 and N > 0 else 0):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int((k + 0.5) * N / n)); ok, f = cap.read()
+        if not ok: break
+        c = min(f.shape[:2]); y, x = (f.shape[0] - c) // 2, (f.shape[1] - c) // 2; fs.append(cv2.resize(f[y:y + c, x:x + c], (90, 90), interpolation=cv2.INTER_AREA))
+    cap.release()
+    if len(fs) == n: (out := THUMBS / f"strip-{h}_{N / fps:.2f}.jpg").write_bytes(cv2.imencode(".jpg", cv2.hconcat(fs))[1].tobytes()); return out
+    if not (m := probe_video(p)): return None  # OpenCV couldn't (some HEVC on a Mac): the ffmpeg command
+    ff(["-i", p, "-an", "-vf", f"fps={n / m['duration_s']:.6f},crop=min(iw\\,ih):min(iw\\,ih),scale=90:90,tile={n}x1", "-frames:v", "1", (out := THUMBS / f"strip-{h}_{m['duration_s']:.2f}.jpg")], "strip")
+    return out
+
+
+def slide(reel, i, k):  # Slide: the video (grid tile k, or the shot's own when k < 0), its strip and length, the shot's length, where the window starts
+    data, d = editing(reel); s = data["shots"][i]; p = S["slide"] = Path(s["src"]).resolve() if k < 0 else S["grid"][k]
+    if not (f := strip(p)): raise RuntimeError(f"can't read {p.name}")
+    return {"name": p.name, "strip": f"/tc/{f.name}", "dur": float(f.stem.split("_")[1]), "len": (s["end_f"] - s["start_f"]) / data["fps"], "start": s["start"] if k < 0 else 0}
+
+
+def slide_score(reel, i, start):  # the window's score, for reference only; the models load quietly the first time
+    data, d = editing(reel); s = data["shots"][i]
+    with SCORE: keys = models(data.get("models", ["current"]), True); probe_video(S["slide"]); return rate(S["slide"], start, max((s["end_f"] - s["start_f"]) / data["fps"], 0.5), keys)
+
+
 def keep(tab=0):  # the selected tab's clip becomes the shot's clip, and the reel is re-rendered with it right away
     reel, i, cs = S.pop("pending"); data, d = editing(reel); data["shots"][i] = {k: x for k, x in cs[tab].items() if k != "preview"}; return save(reel)
 
@@ -511,7 +540,10 @@ class H(SimpleHTTPRequestHandler):
         try:  # Choose a video: the grid's list, one icon (made on first ask)
             if q[0] == "/list": return self.reply(grid(a["reel"], int(a["shot"])))
             if q[0] == "/thumb": return self.reply(tile(thumb(S["grid"][int(a["i"])])))
+            if q[0] == "/slide": return self.reply(slide(a["reel"], int(a["shot"]), int(a["i"])))  # Slide: open a video, score a window
+            if q[0] == "/score": return self.reply(slide_score(a["reel"], int(a["shot"]), float(a["start"])))
         except Exception as e: traceback.print_exc(); return self.reply({"error": last(e)})
+        if q[0] == "/sv": return self.send_file(S["slide"], True)  # the video open in Slide
         if q[0].startswith("/tc/"): return self.send_file(THUMBS / Path(unquote(q[0][4:])).name, True)
         if q[0] == "/v": return self.send_file(S["grid"][int(a["i"])], True)  # a grid video, whole, for the preview: only videos in the list are sent
         self.reply(b"not found", "text/plain", 404)
@@ -524,11 +556,12 @@ class H(SimpleHTTPRequestHandler):
         if route == "/keep" and "pending" not in S: return self.reply({"error": "nothing to keep"})
         job = {"/start": lambda: build(a["link"].strip(), Path(a["folder"].strip().strip('"')), int(a["tries"]), float(a["threshold"]),
                                        [k for k in a.get("models", ["current"]) if k in MODELS] or ["current"]),
-               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", "")), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"])}[route]
+               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", ""), start=float(a.get("start", 0))), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"])}[route]
         def run():
-            try: job()
+            try:
+                with SCORE: job()  # waits for a Slide score in flight: they share the decoders and models
             except Exception as e: traceback.print_exc(); state.update(stage="error", msg=last(e))
-        busy("Starting"); threading.Thread(target=run, daemon=True).start(); self.reply({"ok": True})
+        busy("Finishing the score first (the models load the first time)" if SCORE.locked() else "Starting"); threading.Thread(target=run, daemon=True).start(); self.reply({"ok": True})
 
     def send_file(self, p, anywhere=False):  # with HTTP Range, so the browser can seek in the video; templates/ only, unless the caller checked p
         p = Path(p).resolve() if anywhere else Path(unquote(str(p))).resolve()
@@ -618,19 +651,21 @@ button.hot{background:linear-gradient(90deg,#f5b041,#e67e22);color:#111;border-c
 #info{color:#888;width:100%;text-align:center} #info .q,.cap .q{color:#e74c3c} #msg{color:#aaa} #stage{flex:1;min-height:0;display:flex;gap:16px;justify-content:center} .cap{font-size:12px;color:#aaa;display:flex;gap:8px;align-items:center} .cap b{color:#eee} #R .cap b{color:#f5b041}
 figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px} figure video{flex:1;min-height:0;width:100%;object-fit:contain}
 #tabs{display:flex;gap:4px;flex:none} .tab{padding:2px 10px;background:#1b1b1b;border:1px solid #333;border-radius:10px;cursor:pointer;font-size:11px;color:#aaa} .tab:hover{background:#2a2a2a} .tab.on{background:#e67e22;color:#111;border-color:transparent} .tab .lo{color:#e74c3c}
-#grid,#look{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;background:#111} #look{z-index:6;background:#000e;padding:14px;gap:10px;box-sizing:border-box}
-#gbar,#lbar{display:flex;flex:none;gap:12px;align-items:center;justify-content:center;font-size:12px;color:#aaa} #gbar{padding:10px 16px;background:#1a1a1a} #gbar input{accent-color:#e67e22;width:160px;vertical-align:middle}
+#grid,#look,#slide{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;background:#111} #look,#slide{z-index:6;background:#000e;padding:14px;gap:10px;box-sizing:border-box} #slide{z-index:7;background:#000}
+#strip{position:relative;flex:none;aspect-ratio:16/1;background:#1b1b1b center/100% 100% no-repeat;border-radius:6px;overflow:hidden;cursor:pointer;touch-action:none}
+#win{position:absolute;top:0;bottom:0;min-width:6px;box-sizing:border-box;border:3px solid #f5b041;border-radius:6px;box-shadow:0 0 0 9999px #000a;cursor:grab} #sscore{color:#f5b041}
+#gbar,#lbar,#sbar{flex-wrap:wrap;display:flex;flex:none;gap:12px;align-items:center;justify-content:center;font-size:12px;color:#aaa} #gbar{padding:10px 16px;background:#1a1a1a} #gbar input{accent-color:#e67e22;width:160px;vertical-align:middle}
 #tiles{flex:1;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--s),1fr));gap:10px;padding:16px;align-content:start}
 .v{min-width:0;display:flex;flex-direction:column;align-items:center;gap:5px;padding:6px;border-radius:8px;cursor:pointer;font-size:11px;color:#aaa;user-select:none}
 .v .im{position:relative;width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#1b1b1b;border-radius:6px;color:#666} .v img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .v span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .v.on{background:#e67e2240;color:#fff} .v.cur .im{outline:2px solid #f5b041;outline-offset:2px} .v.short{opacity:.3}
-#lv{flex:1;min-height:0;width:100%;object-fit:contain}
+#lv,#sv{flex:1;min-height:0;width:100%;object-fit:contain}
 </style>
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
 <label><input type="checkbox" id="loop" checked> Loop shot</label><button id="all">Play whole reel</button><button id="rep" hidden>Replace clip</button>
 <button id="export" class="hot" hidden>Save reel</button><span id="info"></span></div>
-<div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
+<div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button id="slideSame">Slide same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
   <button id="x">✕</button></span>
   <span id="msg"></span><span id="decide" hidden><button id="keep" class="hot">Keep new</button><button id="againSame">Try again: same video</button>
   <button id="againRand">Try again: random video</button><button class="browse">Try again: choose a video</button><button id="cancel">Cancel</button></span></div>
@@ -639,9 +674,12 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
   <figure id="R" hidden><div class="cap"><b>New</b><span id="rcap"></span><button id="rplay">▶ Play</button><label><input type="checkbox" id="rloop"> Loop</label></div>
   <div id="tabs"></div><video id="cand" playsinline></video></figure></div>
 <div id="grid" hidden><div id="gbar"><span id="gn"></span><label>Icon size <input type="range" id="gsize" min="120" max="480" step="10"></label>
-  <button id="gsel" class="hot" disabled>Select</button><button id="gx">Cancel</button><span>Click: highlight · Enter / double-click: select · Space: preview</span></div><div id="tiles"></div></div>
-<div id="look" hidden><video id="lv" playsinline controls></video><div id="lbar"><span id="lname"></span><button id="lsel" class="hot">Select</button><button id="lx">Close</button>
-  <span>Space: play / pause · ← →: previous / next · Enter: select · Esc: close</span></div></div>
+  <button id="gsel" class="hot" disabled>Select</button><button id="gslide" disabled>Slide</button><button id="gx">Cancel</button><span>Click: highlight · Enter / double-click: select · Space: preview · S: slide</span></div><div id="tiles"></div></div>
+<div id="look" hidden><video id="lv" playsinline controls></video><div id="lbar"><span id="lname"></span><button id="lsel" class="hot">Select</button><button id="lslide">Slide</button><button id="lx">Close</button>
+  <span>Space / Esc: close · ← →: previous / next · Enter: select · S: slide</span></div></div>
+<div id="slide" hidden><video id="sv" playsinline muted></video><div id="strip"><div id="win"></div></div>
+  <div id="sbar"><span id="sname"></span><span id="sscore"></span><button id="splay">▶ Play</button><button id="suse" class="hot">Use this clip</button><button id="sx">Back</button>
+  <span>Drag the window · ← →: 0.1 s · Shift + ← →: 1 s · Space: play · Enter: use · Esc: back</span></div></div>
 <script>
 const D = /*DATA*/null, $ = s => document.querySelector(s), P = $('#player'), Q = $('#cand'), T = f => f / D.fps;
 const fmt = s => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, '0')}`, name = s => s.src.split(/[\\/]/).pop();
@@ -679,10 +717,11 @@ $('#prev').onclick = () => !pend && pick(cur - 1); $('#next').onclick = () => !p
 $('#all').onclick = () => { if (pend) return; whole = true; P.currentTime = 0; P.play().catch(() => {}); };
 const toggle = v => v.paused ? v.play().catch(() => {}) : v.pause();
 P.onclick = $('#lplay').onclick = () => P.paused ? pick(cur) : P.pause(); Q.onclick = $('#rplay').onclick = () => toggle(Q);
-const keys = () => !$('#look').hidden ? {' ': () => toggle(LV), Escape: unlook, Enter: () => use(hi), ArrowRight: () => look(hi + 1), ArrowLeft: () => look(hi - 1)}
-  : !$('#grid').hidden ? {' ': () => look(hi), Enter: () => use(hi), Escape: () => $('#gx').onclick()}
-  : {ArrowRight: () => $('#next').onclick(), ArrowLeft: () => $('#prev').onclick(), ' ': () => toggle(P)};  // the preview, the grid, or the viewer
-onkeydown = e => { const f = keys()[e.key]; if (!f || (e.target.tagName === 'INPUT' && e.target.type !== 'range')) return; e.preventDefault(); f(); };
+const keys = () => !$('#slide').hidden ? {' ': splay, Enter: suse, Escape: unslide, ArrowRight: e => place(W.st + (e.shiftKey ? 1 : 0.1)), ArrowLeft: e => place(W.st - (e.shiftKey ? 1 : 0.1))}
+  : !$('#look').hidden ? {' ': unlook, Escape: unlook, Enter: () => use(hi), s: () => slide(hi), ArrowRight: () => look(hi + 1), ArrowLeft: () => look(hi - 1)}
+  : !$('#grid').hidden ? {' ': () => look(hi), Enter: () => use(hi), s: () => slide(hi), Escape: () => $('#gx').onclick()}
+  : {ArrowRight: () => $('#next').onclick(), ArrowLeft: () => $('#prev').onclick(), ' ': () => toggle(P)};  // Slide, the preview, the grid, or the viewer
+onkeydown = e => { const f = keys()[e.key.length === 1 ? e.key.toLowerCase() : e.key]; if (!f || (e.target.tagName === 'INPUT' && e.target.type !== 'range')) return; e.preventDefault(); f(e); };
 // ---- editing: only when the page comes from the server (opened as a file it is view-only)
 const post = (u, b) => fetch(u, {method: 'POST', body: JSON.stringify(b)}).then(r => r.json()), reel = `${D.template}/${D.video}`;
 const ui = (choose, decide, msg = '') => { $('#edit').hidden = !(choose || decide || msg); $('#choose').hidden = !choose; $('#decide').hidden = !decide; $('#msg').textContent = msg; };
@@ -701,9 +740,9 @@ $('#rloop').onchange = () => Q.loop = $('#rloop').checked;
 async function wait(done) { const s = await (await fetch('/status')).json();  // follows a replace / keep job on the server
   if (s.stage === 'working') { ui(false, false, s.msg); return setTimeout(() => wait(done), 400); }
   s.stage === 'error' ? ui(!pend, !!pend, 'Failed: ' + s.msg) : done(s); }
-function replace(m, path = '') { const i = cur, first = !pend;
+function replace(m, path = '', start = 0) { const i = cur, first = !pend;
   if (first) { P.pause(); pick(i, false); }  // the left is set once, paused on the shot's first frame; try-agains never touch it
-  post('/replace', {reel, shot: i, mode: m, path}).then(() => wait(s => compare({i, cs: s.cands, tab: 0}))); }
+  post('/replace', {reel, shot: i, mode: m, path, start}).then(() => wait(s => compare({i, cs: s.cands, tab: 0}))); }
 document.querySelectorAll('#choose [data-m]').forEach(b => b.onclick = () => replace(b.dataset.m));
 // ---- Choose a video: every video in the footage folder as icons, like Finder's Icons view. Click highlights; Enter, double-click or Select uses it; Space previews it whole
 const LV = $('#lv'), gs = $('#gsize'); let G = null, hi = -1;  // the grid (its tiles, the shot it was opened for), the highlighted tile
@@ -712,7 +751,7 @@ gs.oninput = () => { $('#tiles').style.setProperty('--s', gs.value + 'px'); try 
 gs.oninput(); new ResizeObserver(() => G?.tiles[hi]?.el.scrollIntoView({block: 'nearest'})).observe($('#tiles'));  // a resized window keeps the highlighted video in view
 function light(k, scroll = true) {  // highlight tile k; Select names it (off for a video shorter than the shot)
   G.tiles[hi]?.el.classList.remove('on'); hi = k; const t = G.tiles[k]; t.el.classList.add('on'); scroll && t.el.scrollIntoView({block: 'nearest'});
-  $('#gsel').disabled = !!t.short; $('#gsel').textContent = 'Select ' + t.name;
+  $('#gsel').disabled = $('#gslide').disabled = !!t.short; $('#gsel').textContent = 'Select ' + t.name;
 }
 function paint(k) {  // tile k's icon is ready (img null: the video can't be read)
   const t = G.tiles[k]; if (t.dur === undefined) return; t.short = !(t.dur >= G.need); t.el.classList.toggle('short', t.short);
@@ -744,12 +783,45 @@ const ungrid = () => { G.top = $('#tiles').scrollTop; $('#grid').hidden = true; 
 function use(k) { const t = G.tiles[k]; if (!t || t.short) return; unlook(); ungrid(); replace('path', t.path); }
 function look(k) {  // tile k's whole video, starting from its icon
   const t = G.tiles[k]; if (!t) return; light(k); LV.poster = t.img || ''; LV.src = `/v?i=${k}`; LV.play().catch(() => {});
-  $('#lname').textContent = t.name + (t.short ? ' · shorter than this shot' : ''); $('#lsel').disabled = !!t.short; $('#look').hidden = false; document.activeElement?.blur();
+  $('#lname').textContent = t.name + (t.short ? ' · shorter than this shot' : ''); $('#lsel').disabled = $('#lslide').disabled = !!t.short; $('#look').hidden = false; document.activeElement?.blur();
 }
 const unlook = () => { LV.pause(); LV.removeAttribute('src'); LV.load(); $('#look').hidden = true; };
 LV.onerror = () => LV.getAttribute('src') && ($('#lname').textContent += " · this browser can't play it (Select still works)");
 document.querySelectorAll('.browse').forEach(b => b.onclick = browse);
 $('#gsel').onclick = $('#lsel').onclick = () => use(hi); $('#lx').onclick = unlook; $('#gx').onclick = () => { ungrid(); ui(!pend, !!pend); };
+// ---- Slide: a window as long as the shot, slid along the video's frame strip; Play plays just the window under the reel's audio; the score is for reference only
+const SV = $('#sv'), AU = new Audio(), clamp = st => Math.max(0, Math.min(W.dur - W.len - 0.05, st)); let W = null, sbusy = false;
+async function slide(k = -1) {  // k: a grid tile; -1: the shot's own video, from its current moment
+  if (k >= 0 && (!G.tiles[k] || G.tiles[k].short)) return; LV.pause(); document.body.style.cursor = 'progress';
+  const r = await fetch(`/slide?reel=${encodeURIComponent(reel)}&shot=${cur}&i=${k}`).then(r => r.json()).catch(e => ({error: String(e)})); document.body.style.cursor = '';
+  if (r.error) return alert('Slide: ' + r.error);
+  W = {...r, k, st: r.start}; $('#strip').style.backgroundImage = `url("${r.strip}")`; $('#win').style.width = `${100 * r.len / r.dur}%`;
+  SV.src = `/sv?k=${k}&t=${Date.now()}`; AU.src ||= `/t/${D.template}/audio.wav`; $('#slide').hidden = false; document.activeElement?.blur(); place(r.start);
+}
+function place(st) {  // the window starts at st: the big player shows that frame; a score follows once you stop
+  stop(); W.st = clamp(st); $('#win').style.left = `${100 * W.st / W.dur}%`; SV.currentTime = W.st; clearTimeout(W.t); W.t = setTimeout(rescore, 500);
+  $('#sname').textContent = `${W.name} · ${fmt(W.st)} - ${fmt(W.st + W.len)} of ${fmt(W.dur)}${W.bad ? " · this browser can't show it: slide by the strip" : ''}`; $('#sscore').textContent = 'scoring…';
+}
+async function rescore() {  // one score at a time; only the latest window's is shown
+  if (sbusy) return W.t = setTimeout(rescore, 200); sbusy = true; const w = W, st = W.st;
+  const r = await fetch(`/score?reel=${encodeURIComponent(reel)}&shot=${cur}&start=${st}`).then(r => r.json()).catch(e => ({error: String(e)})); sbusy = false;
+  if (w === W && st === W.st) $('#sscore').textContent = r.error ? "score: can't tell" : `score ${r.score.toFixed(2)}`;
+}
+async function splay() {  // the window once, the video muted under the reel's audio for this shot; again stops it
+  if (!SV.paused) return stop(); SV.currentTime = W.st; AU.currentTime = T(D.shots[cur].start_f);
+  await Promise.all([SV, AU].map(m => m.seeking && new Promise(ok => m.addEventListener('seeked', ok, {once: true})))); SV.play().catch(() => {}); AU.play().catch(() => {});
+}
+const stop = () => { SV.pause(); AU.pause(); if (W) SV.currentTime = W.st; };
+setInterval(() => { if (W && !SV.paused && SV.currentTime >= W.st + W.len) stop(); $('#splay').textContent = SV.paused ? '▶ Play' : '■ Stop'; }, 10);
+$('#strip').onpointerdown = e => {  // drag the window, or click the strip to centre it there
+  const box = $('#strip').getBoundingClientRect(), at = x => (x - box.left) / box.width * W.dur, off = e.target.id === 'win' ? at(e.clientX) - W.st : W.len / 2;
+  place(at(e.clientX) - off); $('#strip').setPointerCapture(e.pointerId); $('#strip').onpointermove = m => place(at(m.clientX) - off);
+  $('#strip').onpointerup = () => $('#strip').onpointermove = null;
+};
+function suse() { const k = W.k, st = W.st; unslide(); if (k >= 0) { unlook(); ungrid(); } replace('slide', '', st); }
+const unslide = () => { stop(); clearTimeout(W?.t); SV.removeAttribute('src'); SV.load(); $('#slide').hidden = true; };
+SV.onerror = () => { if (SV.getAttribute('src') && W) { W.bad = true; place(W.st); } };
+$('#slideSame').onclick = () => slide(); $('#gslide').onclick = $('#lslide').onclick = () => slide(hi); $('#splay').onclick = splay; $('#suse').onclick = suse; $('#sx').onclick = unslide;
 $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, false);
 $('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
