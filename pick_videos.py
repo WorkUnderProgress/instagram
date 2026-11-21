@@ -4,10 +4,10 @@ The first run installs the packages it needs into this Python; work is kept next
 (+ deno for YouTube Shorts). The page takes the link, your footage folder, the scoring models, tries and threshold; each shot gets
 random clips of random videos until one clears the threshold (else the best, marked low), rendered under the reel's audio. The viewer
 replaces clips; Save reel writes <footage folder>/template_reel_output/<reel id>/ (the reel + one clip per shot)."""
-import argparse, datetime, importlib.util, json, os, random, re, shutil, statistics, subprocess, sys, threading, time, traceback, types, webbrowser
+import argparse, datetime, hashlib, importlib.util, json, os, random, re, shutil, statistics, subprocess, sys, threading, time, traceback, types, webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, unquote
 
 NEED = {"numpy": "numpy==2.5.3", "cv2": "opencv-python==5.0.0.93", "scenedetect": "scenedetect==0.7.1", "yt_dlp": "yt-dlp==2026.8.19", "torch": "torch==2.14.1",
         "torchvision": "torchvision==0.29.1", "open_clip": "open_clip_torch==3.3.0", "pyiqa": "pyiqa==0.1.16", "transformers": "transformers==5.22.0", "timm": "timm==1.0.30",
@@ -28,7 +28,8 @@ OUTPUT = "template_reel_output"  # Save reel writes here, inside the footage fol
 CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_threshold": 27.0, "wipe_detail": 40, "wipe_min_px": 20, "wipe_blank_px": 5, "merge_frames": 1, "min_shot_s": 0.5}
 DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/heads/master.zip", "https://github.com/QualityAssessment/DOVER/releases/download/"  # S-Lab licence: non-commercial
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
-LOCK, LOADED, COOKIES, DOVER_FRAMES, CHOSEN = threading.Lock(), {}, {}, {}, set()  # CHOSEN: videos picked in the Open dialog, the only files outside templates/ the server sends
+LOCK, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), {}, {}, {}
+THUMBS = CACHE / "thumbs"  # Choose a video's icons: <hash of path+size+mtime>_<duration s>.jpg
 state = {"stage": "setup", "tries": TRIES, "threshold": THRESHOLD, "max_tries": MAX_TRIES}
 S = {"metas": {}, "readers": {}}  # per process: each video's probe + reader, the reel being edited
 STATS = CACHE / "template_reel_stats.json"; stats = json.loads(STATS.read_text()) if STATS.is_file() else {}
@@ -444,23 +445,27 @@ def replace(reel, i, mode, path="", seed=None):  # 5 delta-stratified candidates
     S["pending"] = (reel, i, cands); state.update(stage="preview", reel=reel, shot=i, cands=cands, msg=""); save_stats(); return cands
 
 
-WIN_OPEN = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; "
-            "$d = New-Object Windows.Forms.OpenFileDialog -Property @{Title = 'Choose a video'; InitialDirectory = $env:F; Filter = $env:X}; "
-            "if ($d.ShowDialog((New-Object Windows.Forms.Form -Property @{TopMost = $true})) -eq 'OK') { $d.FileName }")  # TopMost owner: opens in front of the browser
+def tkey(p): st = p.stat(); return hashlib.sha1(f"{p}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:16]  # a changed video gets a new icon
+def tile(f): return {"img": f"/tc/{f.name}", "dur": float(f.stem.split("_")[1])} if f else {"img": None, "dur": None}  # None: unreadable
 
 
-def choose(reel):  # the system's Open dialog at the footage folder (Mac: Finder, Space = Quick Look); {} if cancelled. Windows previews in the page, from a poster frame
-    data, d = editing(reel); env = os.environ | {"F": str(Path(data["folder"])), "X": "Videos|" + ";".join("*" + e for e in sorted(VIDEO_EXT)) + "|All files|*.*"}
-    mac = sys.platform == "darwin"
-    cmd = (["osascript", "-e", "activate", "-e", 'POSIX path of (choose file with prompt "Choose a video" of type {"public.movie"} default location (POSIX file (system attribute "F")))']
-           if mac else ["powershell", "-NoProfile", "-STA", "-Command", WIN_OPEN])
-    if not (p := subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env).stdout.strip()): return {}
-    CHOSEN.add(Path(p).resolve()); out = {"path": p, "name": Path(p).name, "preview": not mac, "play": "/pick?path=" + quote(p), "poster": ""}
-    if not mac:
-        (d / "previews").mkdir(exist_ok=True); jpg = d / "previews" / f"pick_{stamp()}.jpg"
-        try: ff(["-i", p, "-vf", "thumbnail=30,scale=-2:720", "-frames:v", 1, jpg], "poster"); out["poster"] = f"/t/{d.name}/previews/{jpg.name}"
-        except RuntimeError: pass
-    return out
+def grid(reel, i):  # Choose a video: every video in the footage folder by file name (a phone's shooting order, across subfolders), icons already made, the shot's own video
+    data, d = editing(reel); s = data["shots"][i]; have = {f.name.split("_")[0]: f for f in THUMBS.glob("*_*.jpg")}
+    S["grid"] = sorted((p.resolve() for p in videos(data["folder"])), key=lambda p: (p.name.lower(), str(p).lower()))
+    return {"tiles": [{"name": p.name, "path": str(p), **(tile(f) if (f := have.get(tkey(p))) else {})} for p in S["grid"]],
+            "cur": next((k for k, p in enumerate(S["grid"]) if p == Path(s["src"]).resolve()), -1), "need": max((s["end_f"] - s["start_f"]) / data["fps"], 0.5) + 0.2}
+
+
+def thumb(p):  # the first frame at 480 px + the length, cached in THUMBS. OpenCV's built-in FFmpeg, in-process (~0.15 s; an ffmpeg launch costs ~5 s on Windows), else the ffmpeg command
+    import cv2
+    h = tkey(p); THUMBS.mkdir(parents=True, exist_ok=True); cap = cv2.VideoCapture(str(p)); ok, f = cap.read(); fps, n = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT); cap.release()
+    if ok and fps > 0 and n > 0:  # imencode + write_bytes: cv2.imwrite can't take non-ASCII paths on Windows
+        s = min(1, 480 / max(f.shape[:2])); (out := THUMBS / f"{h}_{n / fps:.2f}.jpg").write_bytes(cv2.imencode(".jpg", cv2.resize(f, None, fx=s, fy=s, interpolation=cv2.INTER_AREA))[1].tobytes()); return out
+    tmp = THUMBS / f"{h}.part.jpg"
+    r = subprocess.run([binary("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-i", str(p), "-an", "-vf", "scale=480:480:force_original_aspect_ratio=decrease",
+                        "-frames:v", "1", str(tmp)], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode or not tmp.is_file() or not (m := re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)): return None
+    return tmp.replace(THUMBS / f"{h}_{int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]):.2f}.jpg")
 
 
 def keep(tab=0):  # the selected tab's clip becomes the shot's clip, and the reel is re-rendered with it right away
@@ -503,10 +508,12 @@ class H(SimpleHTTPRequestHandler):
         if q[0].endswith("_view.html") and (j := TEMPLATES / unquote(q[0][3:]).replace("_view.html", ".json")).is_file():  # always today's viewer
             return self.reply(VIEW.replace("/*DATA*/null", j.read_text()), "text/html; charset=utf-8")
         if q[0].startswith("/t/"): return self.send_file(TEMPLATES / q[0][3:])
-        if q[0] == "/pick": return self.send_file(a.get("path", ""))  # a video picked in the Open dialog, played whole in the page
-        if q[0] == "/choose":  # waits while the Open dialog is up
-            try: return self.reply(choose(a["reel"]))
-            except Exception as e: traceback.print_exc(); return self.reply({"error": last(e)})
+        try:  # Choose a video: the grid's list, one icon (made on first ask)
+            if q[0] == "/list": return self.reply(grid(a["reel"], int(a["shot"])))
+            if q[0] == "/thumb": return self.reply(tile(thumb(S["grid"][int(a["i"])])))
+        except Exception as e: traceback.print_exc(); return self.reply({"error": last(e)})
+        if q[0].startswith("/tc/"): return self.send_file(THUMBS / Path(unquote(q[0][4:])).name, True)
+        if q[0] == "/v": return self.send_file(S["grid"][int(a["i"])], True)  # a grid video, whole, for the preview: only videos in the list are sent
         self.reply(b"not found", "text/plain", 404)
 
     def do_POST(self):
@@ -523,9 +530,9 @@ class H(SimpleHTTPRequestHandler):
             except Exception as e: traceback.print_exc(); state.update(stage="error", msg=last(e))
         busy("Starting"); threading.Thread(target=run, daemon=True).start(); self.reply({"ok": True})
 
-    def send_file(self, p):  # with HTTP Range, so the browser can seek in the video
-        p = Path(unquote(str(p))).resolve()
-        if not p.is_file() or (TEMPLATES.resolve() not in p.parents and p not in CHOSEN): return self.reply(b"not found", "text/plain", 404)
+    def send_file(self, p, anywhere=False):  # with HTTP Range, so the browser can seek in the video; templates/ only, unless the caller checked p
+        p = Path(p).resolve() if anywhere else Path(unquote(str(p))).resolve()
+        if not p.is_file() or not (anywhere or TEMPLATES.resolve() in p.parents): return self.reply(b"not found", "text/plain", 404)
         size = p.stat().st_size; m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
         a, b = (int(m[1]), min(size - 1, int(m[2] or size - 1))) if m else (0, size - 1)
         kind = "video/mp4" if p.suffix.lower() in (".mov", ".m4v") else self.guess_type(str(p))  # browsers play H.264/HEVC .mov sent as mp4
@@ -611,6 +618,13 @@ button.hot{background:linear-gradient(90deg,#f5b041,#e67e22);color:#111;border-c
 #info{color:#888;width:100%;text-align:center} #info .q,.cap .q{color:#e74c3c} #msg{color:#aaa} #stage{flex:1;min-height:0;display:flex;gap:16px;justify-content:center} .cap{font-size:12px;color:#aaa;display:flex;gap:8px;align-items:center} .cap b{color:#eee} #R .cap b{color:#f5b041}
 figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px} figure video{flex:1;min-height:0;width:100%;object-fit:contain}
 #tabs{display:flex;gap:4px;flex:none} .tab{padding:2px 10px;background:#1b1b1b;border:1px solid #333;border-radius:10px;cursor:pointer;font-size:11px;color:#aaa} .tab:hover{background:#2a2a2a} .tab.on{background:#e67e22;color:#111;border-color:transparent} .tab .lo{color:#e74c3c}
+#grid,#look{position:fixed;inset:0;z-index:5;display:flex;flex-direction:column;background:#111} #look{z-index:6;background:#000e;padding:14px;gap:10px;box-sizing:border-box}
+#gbar,#lbar{display:flex;flex:none;gap:12px;align-items:center;justify-content:center;font-size:12px;color:#aaa} #gbar{padding:10px 16px;background:#1a1a1a} #gbar input{accent-color:#e67e22;width:160px;vertical-align:middle}
+#tiles{flex:1;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--s),1fr));gap:10px;padding:16px;align-content:start}
+.v{min-width:0;display:flex;flex-direction:column;align-items:center;gap:5px;padding:6px;border-radius:8px;cursor:pointer;font-size:11px;color:#aaa;user-select:none}
+.v .im{position:relative;width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#1b1b1b;border-radius:6px;color:#666} .v img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.v span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .v.on{background:#e67e2240;color:#fff} .v.cur .im{outline:2px solid #f5b041;outline-offset:2px} .v.short{opacity:.3}
+#lv{flex:1;min-height:0;width:100%;object-fit:contain}
 </style>
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
@@ -619,12 +633,15 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 <div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
   <button id="x">✕</button></span>
   <span id="msg"></span><span id="decide" hidden><button id="keep" class="hot">Keep new</button><button id="againSame">Try again: same video</button>
-  <button id="againRand">Try again: random video</button><button class="browse">Try again: choose a video</button><button id="cancel">Cancel</button></span>
-  <span id="peek" hidden><button id="use" class="hot">Use this video</button><button class="browse">Choose another</button><button id="unpeek">Cancel</button></span></div>
+  <button id="againRand">Try again: random video</button><button class="browse">Try again: choose a video</button><button id="cancel">Cancel</button></span></div>
 <div id="stage"><figure id="L"><div class="cap" hidden><b>Current</b><span id="lcap"></span><button id="lplay">▶ Play</button><label><input type="checkbox" id="lloop"> Loop</label></div>
   <video id="player" playsinline></video></figure>
   <figure id="R" hidden><div class="cap"><b>New</b><span id="rcap"></span><button id="rplay">▶ Play</button><label><input type="checkbox" id="rloop"> Loop</label></div>
   <div id="tabs"></div><video id="cand" playsinline></video></figure></div>
+<div id="grid" hidden><div id="gbar"><span id="gn"></span><label>Icon size <input type="range" id="gsize" min="120" max="480" step="10"></label>
+  <button id="gsel" class="hot" disabled>Select</button><button id="gx">Cancel</button><span>Click: highlight · Enter / double-click: select · Space: preview</span></div><div id="tiles"></div></div>
+<div id="look" hidden><video id="lv" playsinline controls></video><div id="lbar"><span id="lname"></span><button id="lsel" class="hot">Select</button><button id="lx">Close</button>
+  <span>Space: play / pause · ← →: previous / next · Enter: select · Esc: close</span></div></div>
 <script>
 const D = /*DATA*/null, $ = s => document.querySelector(s), P = $('#player'), Q = $('#cand'), T = f => f / D.fps;
 const fmt = s => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, '0')}`, name = s => s.src.split(/[\\/]/).pop();
@@ -662,47 +679,77 @@ $('#prev').onclick = () => !pend && pick(cur - 1); $('#next').onclick = () => !p
 $('#all').onclick = () => { if (pend) return; whole = true; P.currentTime = 0; P.play().catch(() => {}); };
 const toggle = v => v.paused ? v.play().catch(() => {}) : v.pause();
 P.onclick = $('#lplay').onclick = () => P.paused ? pick(cur) : P.pause(); Q.onclick = $('#rplay').onclick = () => toggle(Q);
-onkeydown = e => { if (e.target.tagName === 'INPUT') return; if (e.key === 'ArrowRight') $('#next').onclick(); else if (e.key === 'ArrowLeft') $('#prev').onclick();
-  else if (e.key === ' ') { e.preventDefault(); toggle(peek ? Q : P); } else if (e.key === 'Enter' && peek) $('#use').onclick(); };
+const keys = () => !$('#look').hidden ? {' ': () => toggle(LV), Escape: unlook, Enter: () => use(hi), ArrowRight: () => look(hi + 1), ArrowLeft: () => look(hi - 1)}
+  : !$('#grid').hidden ? {' ': () => look(hi), Enter: () => use(hi), Escape: () => $('#gx').onclick()}
+  : {ArrowRight: () => $('#next').onclick(), ArrowLeft: () => $('#prev').onclick(), ' ': () => toggle(P)};  // the preview, the grid, or the viewer
+onkeydown = e => { const f = keys()[e.key]; if (!f || (e.target.tagName === 'INPUT' && e.target.type !== 'range')) return; e.preventDefault(); f(); };
 // ---- editing: only when the page comes from the server (opened as a file it is view-only)
 const post = (u, b) => fetch(u, {method: 'POST', body: JSON.stringify(b)}).then(r => r.json()), reel = `${D.template}/${D.video}`;
-let peek = null;  // Windows: the video just picked in the Open dialog, shown whole on the right before it's used
-const ui = (choose, decide, msg = '', pk = false) => { $('#edit').hidden = !(choose || decide || msg || pk); $('#choose').hidden = !choose; $('#decide').hidden = !decide; $('#peek').hidden = !pk; $('#msg').textContent = msg; };
+const ui = (choose, decide, msg = '') => { $('#edit').hidden = !(choose || decide || msg); $('#choose').hidden = !choose; $('#decide').hidden = !decide; $('#msg').textContent = msg; };
 function compare(p) {  // current clip on the left (never touched here), 5 proposals on the right as tabs; null closes the split
-  pend = p; $('#R').hidden = !p; $('#L .cap').hidden = !p; if (!p) return Q.removeAttribute('src'), Q.removeAttribute('poster'), Q.load();
-  $('#tabs').innerHTML = p.cs.map((c, j) => `<span class="tab" data-i="${j}">${j + 1}${c.low ? '<span class="lo">*</span>' : ''}</span>`).join("");
+  pend = p; $('#R').hidden = !p; $('#L .cap').hidden = !p; if (!p) return Q.removeAttribute('src'), Q.load();
+  $('#tabs').hidden = p.cs.length <= 1; $('#tabs').innerHTML = p.cs.map((c, j) => `<span class="tab" data-i="${j}">${j + 1}${c.low ? '<span class="lo">*</span>' : ''}</span>`).join("");
   document.querySelectorAll('#tabs .tab').forEach(t => t.onclick = () => { pend.tab = +t.dataset.i; show(); });
   show(); ui(false, true);
 }
 function show() {
-  const c = pend.cs[pend.tab]; $('#R .cap b').textContent = 'New'; $('#tabs').hidden = pend.cs.length <= 1; Q.removeAttribute('poster');
-  Q.src = c.preview; Q.muted = P.muted; Q.loop = $('#rloop').checked;
+  const c = pend.cs[pend.tab]; Q.src = c.preview; Q.muted = P.muted; Q.loop = $('#rloop').checked;
   $('#rcap').innerHTML = ` ${name(c)} @ ${fmt(c.start)} · ${c.score.toFixed(2)}${c.low ? ' <span class="q">(low)</span>' : ''}`;
   document.querySelectorAll('#tabs .tab').forEach((t, j) => t.classList.toggle('on', j === pend.tab));
 }
 $('#rloop').onchange = () => Q.loop = $('#rloop').checked;
 async function wait(done) { const s = await (await fetch('/status')).json();  // follows a replace / keep job on the server
   if (s.stage === 'working') { ui(false, false, s.msg); return setTimeout(() => wait(done), 400); }
-  s.stage === 'error' ? (pend || compare(null), ui(!pend, !!pend, 'Failed: ' + s.msg)) : done(s); }
-function replace(m, path = '') { const i = cur, first = !pend; peek = null; Q.pause();
+  s.stage === 'error' ? ui(!pend, !!pend, 'Failed: ' + s.msg) : done(s); }
+function replace(m, path = '') { const i = cur, first = !pend;
   if (first) { P.pause(); pick(i, false); }  // the left is set once, paused on the shot's first frame; try-agains never touch it
   post('/replace', {reel, shot: i, mode: m, path}).then(() => wait(s => compare({i, cs: s.cands, tab: 0}))); }
 document.querySelectorAll('#choose [data-m]').forEach(b => b.onclick = () => replace(b.dataset.m));
-const back = () => { peek = null; pend ? (show(), ui(false, true)) : (compare(null), ui(true, false)); };  // the dialog cancelled, or the preview: back to where you were
-async function browse() {  // the system's Open dialog (Mac: Finder, Space = Quick Look, Open = use it); Windows: then the whole video here
-  ui(false, false, 'Choose a video in the window that opened…'); Q.pause();
-  const c = await (await fetch(`/choose?reel=${encodeURIComponent(reel)}`)).json();
-  if (c.error) return back(), $('#msg').textContent = 'Failed: ' + c.error;
-  if (!c.path) return peek ? ui(false, false, '', true) : back();
-  if (!c.preview) return replace('path', c.path);
-  if (!pend && !peek) { P.pause(); pick(cur, false); }
-  peek = c; $('#R').hidden = $('#L .cap').hidden = false; $('#tabs').hidden = true; $('#R .cap b').textContent = 'Preview';
-  Q.poster = c.poster; Q.src = c.play; Q.loop = false; $('#rcap').textContent = ` ${c.name} · whole video · Space plays / pauses`;
-  document.activeElement?.blur(); ui(false, false, '', true);
+// ---- Choose a video: every video in the footage folder as icons, like Finder's Icons view. Click highlights; Enter, double-click or Select uses it; Space previews it whole
+const LV = $('#lv'), gs = $('#gsize'); let G = null, hi = -1;  // the grid (its tiles, the shot it was opened for), the highlighted tile
+try { gs.value = localStorage.gsize || 200; } catch { gs.value = 200; }  // the icon size you left it at
+gs.oninput = () => { $('#tiles').style.setProperty('--s', gs.value + 'px'); try { localStorage.gsize = gs.value; } catch {} G?.tiles[hi]?.el.scrollIntoView({block: 'nearest'}); };
+gs.oninput(); new ResizeObserver(() => G?.tiles[hi]?.el.scrollIntoView({block: 'nearest'})).observe($('#tiles'));  // a resized window keeps the highlighted video in view
+function light(k, scroll = true) {  // highlight tile k; Select names it (off for a video shorter than the shot)
+  G.tiles[hi]?.el.classList.remove('on'); hi = k; const t = G.tiles[k]; t.el.classList.add('on'); scroll && t.el.scrollIntoView({block: 'nearest'});
+  $('#gsel').disabled = !!t.short; $('#gsel').textContent = 'Select ' + t.name;
 }
+function paint(k) {  // tile k's icon is ready (img null: the video can't be read)
+  const t = G.tiles[k]; if (t.dur === undefined) return; t.short = !(t.dur >= G.need); t.el.classList.toggle('short', t.short);
+  t.el.title = `${t.path}\n${t.dur ? t.dur.toFixed(1) + ' s' : "can't read"}${t.short ? ' · shorter than this shot' : ''}`;
+  t.el.firstChild.innerHTML = t.img ? `<img src="${t.img}">` : "can't read"; k === hi && light(k, false);
+}
+const seen = new Set(), io = new IntersectionObserver(es => es.forEach(e => seen[e.isIntersecting ? 'add' : 'delete'](+e.target.dataset.k)), {root: $('#tiles')});
+const todo = () => { const free = k => G.tiles[k].dur === undefined && !G.tiles[k].busy; for (const k of seen) if (free(k)) return k; return G.tiles.findIndex((t, k) => free(k)); };
+async function fill(g) {  // icons not made yet, one at a time per worker: what's on screen first, then the rest in order
+  for (let k; g === G && (k = todo()) >= 0;) { const t = g.tiles[k]; t.busy = true; const r = await fetch(`/thumb?i=${k}`).then(r => r.json()).catch(() => ({}));
+    if (g !== G) return; Object.assign(t, 'dur' in r ? r : {img: null, dur: null}); paint(k); }
+}
+async function browse() {
+  const fresh = G?.shot !== cur;  // a new grid for this shot; the same shot reopens as you left it
+  if (fresh) {
+    ui(false, false, 'Loading your videos…'); const r = await fetch(`/list?reel=${encodeURIComponent(reel)}&shot=${cur}`).then(r => r.json()).catch(e => ({error: String(e)}));
+    if (r.error) return ui(!pend, !!pend, 'Failed: ' + r.error);
+    G = {...r, shot: cur, top: 0}; hi = -1; seen.clear(); io.disconnect(); $('#gn').textContent = `${r.tiles.length} videos`;
+    $('#tiles').replaceChildren(...r.tiles.map((t, k) => { t.el = Object.assign(document.createElement('div'), {className: 'v' + (k === r.cur ? ' cur' : ''),
+      innerHTML: '<div class="im"></div><span></span>', onclick: () => light(k), ondblclick: () => use(k)});
+      t.el.dataset.k = k; t.el.lastChild.textContent = t.name; io.observe(t.el); return t.el; }));
+    r.tiles.forEach((t, k) => paint(k));
+  }
+  ui(false, false); $('#grid').hidden = false; document.activeElement?.blur(); $('#tiles').scrollTop = G.top;
+  if (fresh && G.cur >= 0) { light(G.cur); G.tiles[G.cur].el.scrollIntoView({block: 'center'}); }  // the shot's own video, highlighted, in view
+  if (fresh) setTimeout(() => { for (let n = 0; n < 4; n++) fill(G); }, 100);  // after the first layout, so what's on screen is known
+}
+const ungrid = () => { G.top = $('#tiles').scrollTop; $('#grid').hidden = true; };
+function use(k) { const t = G.tiles[k]; if (!t || t.short) return; unlook(); ungrid(); replace('path', t.path); }
+function look(k) {  // tile k's whole video, starting from its icon
+  const t = G.tiles[k]; if (!t) return; light(k); LV.poster = t.img || ''; LV.src = `/v?i=${k}`; LV.play().catch(() => {});
+  $('#lname').textContent = t.name + (t.short ? ' · shorter than this shot' : ''); $('#lsel').disabled = !!t.short; $('#look').hidden = false; document.activeElement?.blur();
+}
+const unlook = () => { LV.pause(); LV.removeAttribute('src'); LV.load(); $('#look').hidden = true; };
+LV.onerror = () => LV.getAttribute('src') && ($('#lname').textContent += " · this browser can't play it (Select still works)");
 document.querySelectorAll('.browse').forEach(b => b.onclick = browse);
-Q.onerror = () => peek && Q.getAttribute('src') && ($('#rcap').textContent = ` ${peek.name} · this browser can't play it; Use this video anyway, or Choose another`);
-$('#use').onclick = () => replace('path', peek.path); $('#unpeek').onclick = back;
+$('#gsel').onclick = $('#lsel').onclick = () => use(hi); $('#lx').onclick = unlook; $('#gx').onclick = () => { ungrid(); ui(!pend, !!pend); };
 $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, false);
 $('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
