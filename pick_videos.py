@@ -28,6 +28,8 @@ OUTPUT = "template_reel_output"  # Save reel writes here, inside the footage fol
 CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_threshold": 27.0, "wipe_detail": 40, "wipe_min_px": 20, "wipe_blank_px": 5, "merge_frames": 1, "min_shot_s": 0.5}
 DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/heads/master.zip", "https://github.com/QualityAssessment/DOVER/releases/download/"  # S-Lab licence: non-commercial
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
+ESRGAN = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-"  # + x4v3.pth (denoises) / wdn-x4v3.pth (keeps the noise); BSD-3
+K4 = {"denoise": 0.3, "ai": 0.6, "grain": 3, "crf": 16}  # Make 4K's AI version: Real-ESRGAN denoise 0..1 (low keeps texture), AI share of the blend with the plain upscale, grain strength, x264 quality
 LOCK, SCORE, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), threading.Lock(), {}, {}, {}  # SCORE: one scoring job at a time (Slide's score, a replace)
 THUMBS = CACHE / "thumbs"  # Choose a video's icons: <hash of path+size+mtime>_<duration s>.jpg
 state = {"stage": "setup", "tries": TRIES, "threshold": THRESHOLD, "max_tries": MAX_TRIES}
@@ -376,13 +378,13 @@ def search(vids, length, tries, thr, rnd, label, keys):  # videos in the given o
     return {"src": str(best[0]), **best[1], "low": best[1]["score"] < thr}
 
 
-def render(plan, fps, out, audio, a0=0.0):  # one ffmpeg call: each clip from its start, exactly its frames, under the audio from a0
+def render(plan, fps, out, audio, a0=0.0, crf=18):  # one ffmpeg call: each clip from its start, exactly its frames, under the audio from a0 (crf 0: lossless)
     n = lambda p: p["end_f"] - p["start_f"]; t0 = time.time()
     graph = "".join(f"[{i}:v]{','.join(normalise(probe_video(Path(p['src'])), fps))},tpad=stop_mode=clone:stop={n(p)},"
                     f"trim=end_frame={n(p)},setpts=PTS-STARTPTS[v{i}];" for i, p in enumerate(plan))
     (gf := out.with_suffix(".graph.txt")).write_text(graph + "".join(f"[v{i}]" for i in range(len(plan))) + f"concat=n={len(plan)}:v=1:a=0[v]")
     ff([*sum([["-ss", f"{p['start']:.3f}", "-i", p["src"]] for p in plan], []), "-ss", f"{a0:.4f}", "-t", f"{sum(map(n, plan)) / fps:.4f}",
-        "-i", audio, "-/filter_complex", gf, "-map", "[v]", "-map", f"{len(plan)}:a", "-c:v", "libx264", "-crf", "18",
+        "-i", audio, "-/filter_complex", gf, "-map", "[v]", "-map", f"{len(plan)}:a", "-c:v", "libx264", "-crf", str(crf),
         "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out], "render")
     gf.unlink(); note("render_s", time.time() - t0)
 
@@ -516,6 +518,52 @@ def export(reel):  # Save reel: the final reel + every shot as its own numbered 
     state.update(stage="exported", folder=str(out), msg=""); return out
 
 
+def esrgan():  # Real-ESRGAN's compact general model (SRVGGNetCompact, x4); its denoise strength blends its two weight sets, as Real-ESRGAN does
+    import torch; nn = torch.nn
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__(); self.up = nn.PixelShuffle(4)
+            self.body = nn.ModuleList([nn.Conv2d(3, 64, 3, 1, 1), nn.PReLU(64), *sum([[nn.Conv2d(64, 64, 3, 1, 1), nn.PReLU(64)] for _ in range(32)], []), nn.Conv2d(64, 48, 3, 1, 1)])
+        def forward(self, x):
+            y = x
+            for m in self.body: y = m(y)
+            return self.up(y) + nn.functional.interpolate(x, scale_factor=4, mode="nearest")
+    w = []
+    for v in ("x4v3", "wdn-x4v3"):
+        if not (f := MODELS_DIR / f"realesr-general-{v}.pth").is_file(): f.parent.mkdir(parents=True, exist_ok=True); torch.hub.download_url_to_file(f"{ESRGAN}{v}.pth", str(f))
+        w.append((c := torch.load(f, map_location="cpu")).get("params_ema", c.get("params")))
+    net = Net(); net.load_state_dict({k: K4["denoise"] * w[0][k] + (1 - K4["denoise"]) * w[1][k] for k in w[0]}); return net.eval()
+
+
+def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos (same cuts), then 2160x3840 twice, next to Save reel's files:
+    import cv2, torch  # _4k_plain (lanczos) and _4k_ai (Real-ESRGAN 2x, blended with the plain one, light grain). The Mac's GPU when there is one
+    data, d = editing(reel); src = d / data["video"]; out = Path(data["folder"]) / OUTPUT / src.stem; out.mkdir(parents=True, exist_ok=True); fps = data["fps"]
+    busy("4K: a lossless 1080p render from your videos"); tmp = d / f"{src.stem}_4k_master.mp4"; render(data["shots"], fps, tmp, d / "audio.wav", crf=0)
+    c = next(s for s in probe(tmp)["streams"] if s["codec_type"] == "video")  # its colour tags, kept on both 4K files
+    col = [x for k, o in (("color_range", "-color_range"), ("color_space", "-colorspace"), ("color_primaries", "-color_primaries"), ("color_transfer", "-color_trc")) if c.get(k) not in (None, "unknown") for x in (o, c[k])]
+    enc = lambda name: ["-c:v", "libx264", "-crf", K4["crf"], "-preset", "medium", "-pix_fmt", "yuv420p", *col, "-c:a", "copy", "-movflags", "+faststart", out / f"{src.stem}_{name}.mp4"]
+    busy("4K (plain): upscaling"); ff(["-i", tmp, "-vf", "scale=2160:3840:flags=lanczos", *enc("4k_plain")], "4K plain")
+    dev = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"; half = dev != "cpu"
+    busy("4K (AI): loading Real-ESRGAN"); net = esrgan().to(dev); net = net.half() if half else net; n = sum(s["end_f"] - s["start_f"] for s in data["shots"])
+    rgb = f"scale=out_color_matrix={ {'bt470bg': 'bt470'}.get(c.get('color_space'), c.get('color_space') or 'bt709')}:out_range={c.get('color_range') or 'tv'},format=yuv420p,noise=alls={K4['grain']}:allf=t,setparams=" + ":".join(  # raw RGB carries no colour tags: set them
+        f"{p}={c[k]}" for k, p in (("color_range", "range"), ("color_primaries", "color_primaries"), ("color_transfer", "color_trc"), ("color_space", "colorspace")) if c.get(k) not in (None, "unknown"))
+    dec = subprocess.Popen([binary("ffmpeg"), "-v", "error", "-i", str(tmp), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    enc_ai = subprocess.Popen([binary("ffmpeg"), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "2160x3840", "-r", str(fps), "-i", "-", "-i", str(tmp),
+                               "-map", "0:v", "-map", "1:a", "-vf", rgb, *map(str, enc("4k_ai"))], stdin=subprocess.PIPE)
+    t0, gpu = time.time(), lambda a: torch.from_numpy(a).to(dev).permute(2, 0, 1)[None].float() / 255
+    try:
+        with torch.no_grad():
+            for k in range(n):
+                if len(b := dec.stdout.read(1080 * 1920 * 3)) < 1080 * 1920 * 3: break
+                f = np.frombuffer(b, np.uint8).reshape(1920, 1080, 3).copy(); x = gpu(f); ai = torch.nn.functional.avg_pool2d(net(x.half() if half else x).float(), 2)  # x4, then exactly half
+                y = K4["ai"] * ai + (1 - K4["ai"]) * gpu(cv2.resize(f, (2160, 3840), interpolation=cv2.INTER_LANCZOS4))
+                enc_ai.stdin.write((y.clamp(0, 1) * 255).round().byte()[0].permute(1, 2, 0).contiguous().cpu().numpy().tobytes()); left = (time.time() - t0) / (k + 1) * (n - k - 1)
+                busy(f"4K (AI): frame {k + 1} / {n} · about {int(left // 60)} min {int(left % 60):02d} s left")
+    finally: enc_ai.stdin.close(); dec.kill(); enc_ai.wait(); tmp.unlink(missing_ok=True)
+    if enc_ai.returncode: raise RuntimeError("4K (AI): the encode failed")
+    state.update(stage="exported", folder=str(out), msg=""); return out
+
+
 # ---------------------------------------------------------------- the browser app
 class H(SimpleHTTPRequestHandler):
     def reply(self, body, kind="application/json", code=200):
@@ -556,7 +604,7 @@ class H(SimpleHTTPRequestHandler):
         if route == "/keep" and "pending" not in S: return self.reply({"error": "nothing to keep"})
         job = {"/start": lambda: build(a["link"].strip(), Path(a["folder"].strip().strip('"')), int(a["tries"]), float(a["threshold"]),
                                        [k for k in a.get("models", ["current"]) if k in MODELS] or ["current"]),
-               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", ""), start=float(a.get("start", 0))), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"])}[route]
+               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", ""), start=float(a.get("start", 0))), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"]), "/4k": lambda: make4k(a["reel"])}[route]
         def run():
             try:
                 with SCORE: job()  # waits for a Slide score in flight: they share the decoders and models
@@ -664,7 +712,8 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
 <label><input type="checkbox" id="loop" checked> Loop shot</label><button id="all">Play whole reel</button><button id="rep" hidden>Replace clip</button>
-<button id="export" class="hot" hidden>Save reel</button><span id="info"></span></div>
+<button id="export" class="hot" hidden>Save reel</button>
+<button id="k4" hidden title="From your original videos: a plain and an AI 4K version, next to Save reel's files (Mac: ~15-30 min)">Make 4K</button><span id="info"></span></div>
 <div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button id="slideSame">Slide same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
   <button id="x">✕</button></span>
   <span id="msg"></span><span id="decide" hidden><button id="keep" class="hot">Keep new</button><button id="againSame">Try again: same video</button>
@@ -826,10 +875,11 @@ $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, fal
 $('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
 $('#export').onclick = () => post('/export', {reel}).then(() => wait(s => ui(false, false, `Saved: ${s.folder}`)));
+$('#k4').onclick = () => post('/4k', {reel}).then(() => wait(s => ui(false, false, `4K saved (plain + AI): ${s.folder}`)));
 $('#cancel').onclick = () => post('/cancel', {}).then(() => { compare(null); ui(false, false); pick(cur); });
 $('#keep').onclick = () => { const i = pend.i; post('/keep', {tab: pend.tab}).then(() => wait(s => location.href = `${s.url}#shot=${i + 1}`)); };
 pick((+location.hash.split('shot=')[1] || 1) - 1, false);
-if (location.protocol.startsWith('http') && D.template) { $('#rep').hidden = $('#export').hidden = false;  // after a reload: a proposal still waiting, or a job still running
+if (location.protocol.startsWith('http') && D.template) { $('#rep').hidden = $('#export').hidden = $('#k4').hidden = false;  // after a reload: a proposal still waiting, or a job still running
   fetch('/status').then(r => r.json()).then(s => s.stage === 'preview' && s.reel === reel ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0}))
     : s.stage === 'working' && wait(s => s.stage === 'preview' ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0})) : location.href = s.url)); }
 </script>
