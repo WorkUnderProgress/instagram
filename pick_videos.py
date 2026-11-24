@@ -29,6 +29,7 @@ CUT = {"grid_min_diff": 12.0, "grid_ratio": 3.0, "grid_window": 8, "content_thre
 DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/heads/master.zip", "https://github.com/QualityAssessment/DOVER/releases/download/"  # S-Lab licence: non-commercial
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
 ESRGAN = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-"  # + x4v3.pth (denoises) / wdn-x4v3.pth (keeps the noise); BSD-3
+RIFE = "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife426.pth"  # RIFE 4.26 (Practical-RIFE, MIT): Make 4K's in-between frames
 K4 = {"denoise": 0.3, "ai": 0.6, "grain": 3, "crf": 16}  # Make 4K's AI version: Real-ESRGAN denoise 0..1 (low keeps texture), AI share of the blend with the plain upscale, grain strength, x264 quality
 LOCK, SCORE, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), threading.Lock(), {}, {}, {}  # SCORE: one scoring job at a time (Slide's score, a replace)
 THUMBS = CACHE / "thumbs"  # Choose a video's icons: <hash of path+size+mtime>_<duration s>.jpg
@@ -535,32 +536,78 @@ def esrgan():  # Real-ESRGAN's compact general model (SRVGGNetCompact, x4); its 
     net = Net(); net.load_state_dict({k: K4["denoise"] * w[0][k] + (1 - K4["denoise"]) * w[1][k] for k in w[0]}); return net.eval()
 
 
-def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos (same cuts), then 2160x3840 twice, next to Save reel's files:
-    import cv2, torch  # _4k_plain (lanczos) and _4k_ai (Real-ESRGAN 2x, blended with the plain one, light grain). The Mac's GPU when there is one
-    data, d = editing(reel); src = d / data["video"]; out = Path(data["folder"]) / OUTPUT / src.stem; out.mkdir(parents=True, exist_ok=True); fps = data["fps"]
-    busy("4K: a lossless 1080p render from your videos"); tmp = d / f"{src.stem}_4k_master.mp4"; render(data["shots"], fps, tmp, d / "audio.wav", crf=0)
+def rife():  # RIFE 4.26 (Practical-RIFE's IFNet_HDv3): net(a, b, t) = the frame at t (0-1) between a and b; 1x3xHxW in 0-1, H and W multiples of 64
+    import torch; nn, F = torch.nn, torch.nn.functional; act = lambda: nn.LeakyReLU(0.2, True)
+    def warp(x, fl):  # a clamped grid with zero padding = border padding, which MPS gets wrong
+        _, _, H, W = fl.shape; g = torch.stack(torch.meshgrid(torch.linspace(-1, 1, H, device=x.device), torch.linspace(-1, 1, W, device=x.device), indexing="ij")[::-1])[None]
+        g = (g + torch.cat([fl[:, :1] / ((W - 1) / 2), fl[:, 1:2] / ((H - 1) / 2)], 1)).permute(0, 2, 3, 1).clamp(-1, 1)
+        return F.grid_sample(x, g, mode="bilinear", padding_mode="zeros", align_corners=True)
+    class Res(nn.Module):
+        def __init__(s, c): super().__init__(); s.conv = nn.Conv2d(c, c, 3, 1, 1); s.beta = nn.Parameter(torch.ones(1, c, 1, 1)); s.relu = act()
+        def forward(s, x): return s.relu(s.conv(x) * s.beta + x)
+    class Block(nn.Module):
+        def __init__(s, i, c):
+            super().__init__(); s.conv0 = nn.Sequential(nn.Sequential(nn.Conv2d(i, c // 2, 3, 2, 1), act()), nn.Sequential(nn.Conv2d(c // 2, c, 3, 2, 1), act()))
+            s.convblock = nn.Sequential(*[Res(c) for _ in range(8)]); s.lastconv = nn.Sequential(nn.ConvTranspose2d(c, 52, 4, 2, 1), nn.PixelShuffle(2))
+        def forward(s, x, fl, k):
+            x = F.interpolate(x, scale_factor=1 / k, mode="bilinear")
+            if fl is not None: x = torch.cat((x, F.interpolate(fl, scale_factor=1 / k, mode="bilinear") / k), 1)
+            t = F.interpolate(s.lastconv(s.convblock(s.conv0(x))), scale_factor=k, mode="bilinear"); return t[:, :4] * k, t[:, 4:5], t[:, 5:]
+    class Head(nn.Module):
+        def __init__(s): super().__init__(); s.cnn0, s.cnn1, s.cnn2, s.cnn3, s.relu = nn.Conv2d(3, 16, 3, 2, 1), nn.Conv2d(16, 16, 3, 1, 1), nn.Conv2d(16, 16, 3, 1, 1), nn.ConvTranspose2d(16, 4, 4, 2, 1), act()
+        def forward(s, x): return s.cnn3(s.relu(s.cnn2(s.relu(s.cnn1(s.relu(s.cnn0(x)))))))
+    class Net(nn.Module):
+        def __init__(s):
+            super().__init__(); s.encode = Head(); s.block0 = Block(15, 192)
+            for k, c in ((1, 128), (2, 96), (3, 64), (4, 32)): setattr(s, f"block{k}", Block(28, c))
+        def forward(s, a, b, t):
+            t = a[:, :1] * 0 + t; f0, f1 = s.encode(a), s.encode(b); fl = m = ft = None; wa, wb = a, b
+            for i, k in enumerate((16, 8, 4, 2, 1)):
+                if fl is None: fl, m, ft = s.block0(torch.cat((a, b, f0, f1, t), 1), None, k)
+                else: d, m, ft = getattr(s, f"block{i}")(torch.cat((wa, wb, warp(f0, fl[:, :2]), warp(f1, fl[:, 2:4]), t, m, ft), 1), fl, k); fl = fl + d
+                wa, wb = warp(a, fl[:, :2]), warp(b, fl[:, 2:4])
+            m = torch.sigmoid(m); return wa * m + wb * (1 - m)
+    if not (f := MODELS_DIR / "rife426.pth").is_file(): f.parent.mkdir(parents=True, exist_ok=True); torch.hub.download_url_to_file(RIFE, str(f))
+    w = {k.removeprefix("module."): v for k, v in torch.load(f, map_location="cpu").items()}; net = Net(); net.load_state_dict({k: w[k] for k in net.state_dict()}); return net.eval()
+
+
+def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos (same cuts, 60 fps at least), then 2160x3840 three times, next to Save reel's files:
+    import cv2, torch  # _4k_plain (lanczos), _4k_ai (Real-ESRGAN 2x, blended with the plain one, light grain), _4k_ai_smooth (the same, with RIFE's in-between frames where a slower clip repeats one). The Mac's GPU when there is one
+    data, d = editing(reel); src = d / data["video"]; out = Path(data["folder"]) / OUTPUT / src.stem; out.mkdir(parents=True, exist_ok=True); fps = max(data["fps"], 60)
+    shots = [{**s, "start_f": round(s["start_f"] * fps / data["fps"]), "end_f": round(s["end_f"] * fps / data["fps"])} for s in data["shots"]]  # the cuts at that rate
+    busy("4K: a lossless 1080p render from your videos"); tmp = d / f"{src.stem}_4k_master.mp4"; render(shots, fps, tmp, d / "audio.wav", crf=0)
     c = next(s for s in probe(tmp)["streams"] if s["codec_type"] == "video")  # its colour tags, kept on both 4K files
     col = [x for k, o in (("color_range", "-color_range"), ("color_space", "-colorspace"), ("color_primaries", "-color_primaries"), ("color_transfer", "-color_trc")) if c.get(k) not in (None, "unknown") for x in (o, c[k])]
     enc = lambda name: ["-c:v", "libx264", "-crf", K4["crf"], "-preset", "medium", "-pix_fmt", "yuv420p", *col, "-c:a", "copy", "-movflags", "+faststart", out / f"{src.stem}_{name}.mp4"]
     busy("4K (plain): upscaling"); ff(["-i", tmp, "-vf", "scale=2160:3840:flags=lanczos", *enc("4k_plain")], "4K plain")
     dev = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"; half = dev != "cpu"
-    busy("4K (AI): loading Real-ESRGAN"); net = esrgan().to(dev); net = net.half() if half else net; n = sum(s["end_f"] - s["start_f"] for s in data["shots"])
+    busy("4K (AI): loading Real-ESRGAN and RIFE"); net = esrgan().to(dev); net = net.half() if half else net; mid = rife().to(dev)
+    n = sum(lens := [s["end_f"] - s["start_f"] for s in shots]); cuts = set(np.cumsum(lens).tolist())  # each shot's first frame
     rgb = f"scale=out_color_matrix={ {'bt470bg': 'bt470'}.get(c.get('color_space'), c.get('color_space') or 'bt709')}:out_range={c.get('color_range') or 'tv'},format=yuv420p,noise=alls={K4['grain']}:allf=t,setparams=" + ":".join(  # raw RGB carries no colour tags: set them
         f"{p}={c[k]}" for k, p in (("color_range", "range"), ("color_primaries", "color_primaries"), ("color_transfer", "color_trc"), ("color_space", "colorspace")) if c.get(k) not in (None, "unknown"))
     dec = subprocess.Popen([binary("ffmpeg"), "-v", "error", "-i", str(tmp), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
-    enc_ai = subprocess.Popen([binary("ffmpeg"), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "2160x3840", "-r", str(fps), "-i", "-", "-i", str(tmp),
-                               "-map", "0:v", "-map", "1:a", "-vf", rgb, *map(str, enc("4k_ai"))], stdin=subprocess.PIPE)
-    t0, gpu = time.time(), lambda a: torch.from_numpy(a).to(dev).permute(2, 0, 1)[None].float() / 255
+    pipe = lambda name: subprocess.Popen([binary("ffmpeg"), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "2160x3840", "-r", str(fps), "-i", "-", "-i", str(tmp),
+                               "-map", "0:v", "-map", "1:a", "-vf", rgb, *map(str, enc(name))], stdin=subprocess.PIPE)
+    outs, t0, gpu = [pipe("4k_ai"), pipe("4k_ai_smooth")], time.time(), lambda a: torch.from_numpy(a).to(dev).permute(2, 0, 1)[None].float() / 255
+    byte = lambda y: (y.clamp(0, 1) * 255).round().byte()[0].permute(1, 2, 0).contiguous().cpu().numpy()
+    def up(f):  # a 1080x1920 frame -> its AI 4K one: Real-ESRGAN x4, then exactly half, blended with lanczos
+        x = gpu(f); ai = torch.nn.functional.avg_pool2d(net(x.half() if half else x).float(), 2)
+        return byte(K4["ai"] * ai + (1 - K4["ai"]) * gpu(cv2.resize(f, (2160, 3840), interpolation=cv2.INTER_LANCZOS4))).tobytes()
+    def flush(nxt):  # prev's repeats: _4k_ai keeps them, _4k_ai_smooth gets RIFE's frames between prev and nxt (none across a cut); 1080 wide padded to 1088 for RIFE
+        p = lambda f: torch.nn.functional.pad(gpu(f), (0, 8, 0, 0), mode="replicate")
+        for j in range(1, rep + 1): outs[0].stdin.write(prev[1]); outs[1].stdin.write(prev[1] if nxt is None else up(byte(mid(p(prev[0]), p(nxt), j / (rep + 1))[:, :, :, :1080])))
+    prev, rep = None, 0
     try:
         with torch.no_grad():
             for k in range(n):
                 if len(b := dec.stdout.read(1080 * 1920 * 3)) < 1080 * 1920 * 3: break
-                f = np.frombuffer(b, np.uint8).reshape(1920, 1080, 3).copy(); x = gpu(f); ai = torch.nn.functional.avg_pool2d(net(x.half() if half else x).float(), 2)  # x4, then exactly half
-                y = K4["ai"] * ai + (1 - K4["ai"]) * gpu(cv2.resize(f, (2160, 3840), interpolation=cv2.INTER_LANCZOS4))
-                enc_ai.stdin.write((y.clamp(0, 1) * 255).round().byte()[0].permute(1, 2, 0).contiguous().cpu().numpy().tobytes()); left = (time.time() - t0) / (k + 1) * (n - k - 1)
-                busy(f"4K (AI): frame {k + 1} / {n} · about {int(left // 60)} min {int(left % 60):02d} s left")
-    finally: enc_ai.stdin.close(); dec.kill(); enc_ai.wait(); tmp.unlink(missing_ok=True)
-    if enc_ai.returncode: raise RuntimeError("4K (AI): the encode failed")
+                f = np.frombuffer(b, np.uint8).reshape(1920, 1080, 3).copy()
+                if prev and k not in cuts and np.array_equal(f, prev[0]): rep += 1; continue  # a repeated frame: a 30 fps clip in a 60 fps reel
+                flush(None if k in cuts else f); y = up(f); [o.stdin.write(y) for o in outs]; prev, rep = (f, y), 0; left = (time.time() - t0) / (k + 1) * (n - k - 1)
+                busy(f"4K (AI + smooth): frame {k + 1} / {n} · about {int(left // 60)} min {int(left % 60):02d} s left")
+            flush(None)
+    finally: [o.stdin.close() for o in outs]; dec.kill(); [o.wait() for o in outs]; tmp.unlink(missing_ok=True)
+    if any(o.returncode for o in outs): raise RuntimeError("4K (AI): the encode failed")
     state.update(stage="exported", folder=str(out), msg=""); return out
 
 
@@ -713,7 +760,7 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
 <label><input type="checkbox" id="loop" checked> Loop shot</label><button id="all">Play whole reel</button><button id="rep" hidden>Replace clip</button>
 <button id="export" class="hot" hidden>Save reel</button>
-<button id="k4" hidden title="From your original videos: a plain and an AI 4K version, next to Save reel's files (Mac: ~15-30 min)">Make 4K</button><span id="info"></span></div>
+<button id="k4" hidden title="From your original videos: plain, AI and AI smooth (60 fps) 4K versions, next to Save reel's files (Mac: ~30-50 min)">Make 4K</button><span id="info"></span></div>
 <div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button id="slideSame">Slide same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
   <button id="x">✕</button></span>
   <span id="msg"></span><span id="decide" hidden><button id="keep" class="hot">Keep new</button><button id="againSame">Try again: same video</button>
@@ -875,7 +922,7 @@ $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, fal
 $('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
 $('#export').onclick = () => post('/export', {reel}).then(() => wait(s => ui(false, false, `Saved: ${s.folder}`)));
-$('#k4').onclick = () => post('/4k', {reel}).then(() => wait(s => ui(false, false, `4K saved (plain + AI): ${s.folder}`)));
+$('#k4').onclick = () => post('/4k', {reel}).then(() => wait(s => ui(false, false, `4K saved (plain, AI, AI smooth): ${s.folder}`)));
 $('#cancel').onclick = () => post('/cancel', {}).then(() => { compare(null); ui(false, false); pick(cur); });
 $('#keep').onclick = () => { const i = pend.i; post('/keep', {tab: pend.tab}).then(() => wait(s => location.href = `${s.url}#shot=${i + 1}`)); };
 pick((+location.hash.split('shot=')[1] || 1) - 1, false);
