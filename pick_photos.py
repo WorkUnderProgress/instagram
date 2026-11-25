@@ -1,11 +1,11 @@
-"""Pick carousel photos in the browser: paste a folder, tick the scoring models (time shown), watch it score, pick.
+"""Pick carousel photos in the browser: choose a folder, tick the scoring models (time shown), watch it score, pick.
 
 One file, Windows or Mac. Once: python3 -m pip install pyiqa==0.1.16 aesthetic-predictor-v2-5 open_clip_torch pillow-heif certifi "setuptools<81"
 Then: python3 pick_photos.py [FOLDER] (Windows: python instead of python3)
 Options: [--out DIR] [--port N] [--no-browser] [--similar 0.83]. The browser page opens by itself.
 Submit copies the picked originals to --out (default FOLDER/Picked_<date>); Quit writes nothing.
 """
-import argparse, datetime, http.server, io, json, os, pathlib, re, shutil, sys, threading, time, urllib.parse, webbrowser
+import argparse, datetime, http.server, io, json, os, pathlib, re, shutil, subprocess, sys, threading, time, urllib.parse, webbrowser
 import cv2, numpy as np
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
@@ -60,6 +60,12 @@ def write_cache():
         ks = [k for k in keys if k[0] == d and "base" in cache.get(k, {})]
         ks and np.savez(d / CACHE, keys=np.array([k[1] for k in ks]), base=np.stack([cache[k]["base"] for k in ks]),
                         **{m: np.array([cache[k].get(m, np.nan) for k in ks]) for m in MODELS})
+
+
+def choose(): # the system's folder dialog (Mac: Finder's, else Tk's, in a process of its own); "" if cancelled
+    cmd = ["osascript", "-e", "activate", "-e", 'POSIX path of (choose folder with prompt "Folder to pick photos from")'] if sys.platform == "darwin" else [sys.executable, "-c",
+            "import tkinter as t, tkinter.filedialog as f; r = t.Tk(); r.withdraw(); r.attributes('-topmost', 1); print(f.askdirectory(title='Folder to pick photos from', initialdir='~'))"]
+    return subprocess.run(cmd, capture_output=True, encoding="utf-8", env=os.environ | {"PYTHONIOENCODING": "utf-8"}).stdout.strip()
 
 
 def count(path):
@@ -180,6 +186,8 @@ class H(http.server.BaseHTTPRequestHandler):
             b = io.BytesIO()
             load(files[int(u.path[5:])], 600).save(b, "JPEG", quality=85)
             return self.send(b.getvalue(), "image/jpeg", cache=True)
+        if u.path == "/choose":
+            return self.send({"path": choose()})
         if u.path in ("/count", "/state"):
             return self.send(count(urllib.parse.parse_qs(u.query).get("path", [""])[0]) if u.path == "/count" else state())
         page = PAGE
@@ -212,7 +220,7 @@ section{padding:24px}input[type=text]{width:min(90vw,800px);padding:8px;font:inh
 .stack{background:#1c1c1c;border-radius:8px;padding:5px}
 .stack .more{display:none}.stack.open .more{display:inline-block}.stack.open{outline:1px solid #555}
 .t{position:relative;display:inline-block;margin:2px;cursor:pointer;vertical-align:top}
-.t img{height:200px;display:block;border:4px solid transparent;border-radius:5px}
+.t img{height:var(--s,200px);display:block;border:4px solid transparent;border-radius:5px}
 .t.on img{border-color:#3c9}
 .t span{position:absolute;left:6px;bottom:6px;background:#000b;padding:1px 5px;border-radius:3px;font-size:11px}
 .stack .t:first-child span::before{content:"\2605 "}
@@ -220,10 +228,11 @@ button{padding:6px 14px;cursor:pointer}.stack>button{display:block;margin:4px au
 summary{padding:0 14px;cursor:pointer;color:#aaa}progress{width:240px}
 </style>
 <header><span id="run" hidden><b id="n">0 picked</b> <button onclick="send(1)">Submit selection</button> <progress id="pb" max="1" value="0"></progress>
-</span>
+<label style="display:inline;margin:0">Icon size <input type="range" id="sz" min="120" max="480" step="10"></label></span>
 <button onclick="send(0)">Quit</button><span id="s" style="color:#aaa"></span><span id="er" style="color:#f66"></span></header>
-<section id="s1"><h2>Folder to pick photos from</h2><input type="text" id="path" placeholder="paste the folder path" autofocus>
-<p id="cnt" style="color:#aaa"></p><button id="nx" disabled onclick="models()">Next</button></section>
+<section id="s1"><h2>Folder to pick photos from</h2><button id="ch" onclick="choose()" autofocus>Choose folder…</button>
+<p id="cnt" style="color:#aaa"></p><button id="nx" disabled onclick="models()">Next</button>
+<details style="margin-top:24px"><summary style="padding:0">or paste a path</summary><input type="text" id="path" placeholder="paste the folder path"></details></section>
 <section id="s2" hidden><h2>Scoring models (best first)</h2><div id="ml"></div><p id="tot"></p><button id="go" onclick="start()">Start</button></section>
 <div class="grid" id="g"></div>
 <details id="hd" hidden><summary>hidden: blurry, dark or blown out (<span id="hn">0</span>)</summary><div class="grid" id="h"></div></details>
@@ -236,8 +245,15 @@ const ticked = () => [...ml.querySelectorAll('input:checked')].map(x => x.value)
 path.oninput = () => { clearTimeout(path.t); nx.disabled = true; path.t = setTimeout(check, 300); };
 async function check() {
   C = await (await fetch('/count?path=' + encodeURIComponent(path.value))).json();
-  cnt.textContent = C.error || `${C.photos} photos in ${C.folders} folder(s)`; nx.disabled = !!C.error;
+  cnt.textContent = path.value.trim() && `${path.value.trim()} · ` + (C.error || `${C.photos} photos in ${C.folders} folder(s)`); nx.disabled = !!C.error;
 }
+async function choose() { // the system's folder dialog, opened by the script
+  ch.disabled = true; const r = await (await fetch('/choose')).json(); ch.disabled = false;
+  if (r.path) { path.value = r.path; check(); }
+}
+try { sz.value = localStorage.sz || 200; } catch { sz.value = 200; } // the icon size you left it at
+sz.oninput = () => { document.body.style.setProperty('--s', sz.value + 'px'); try { localStorage.sz = sz.value; } catch {} };
+sz.oninput();
 function models() {
   s1.hidden = true; s2.hidden = false;
   ml.innerHTML = C.models.map((m, k) => `<label><input type="checkbox" value="${m.key}"${k < 4 ? ' checked' : ''}${k ? '' : ' disabled'}>
