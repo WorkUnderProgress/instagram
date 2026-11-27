@@ -30,8 +30,9 @@ DOVER_CODE, DOVER_URL = "https://github.com/VQAssessment/DOVER/archive/refs/head
 LAION_HEAD = "https://github.com/LAION-AI/aesthetic-predictor/raw/main/sa_0_4_vit_b_32_linear.pth"
 ESRGAN = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-"  # + x4v3.pth (denoises) / wdn-x4v3.pth (keeps the noise); BSD-3
 RIFE = "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation/releases/download/models/rife426.pth"  # RIFE 4.26 (Practical-RIFE, MIT): Make 4K's in-between frames
+TEXTDET = "https://huggingface.co/opencv/text_detection_ppocr/resolve/main/text_detection_en_ppocrv3_2023may.onnx"  # PP-OCRv3 text detector (OpenCV zoo, Apache-2.0): finds the template's on-video text
 K4 = {"denoise": 0.3, "ai": 0.6, "grain": 3, "crf": 16}  # Make 4K's AI version: Real-ESRGAN denoise 0..1 (low keeps texture), AI share of the blend with the plain upscale, grain strength, x264 quality
-LOCK, SCORE, LOADED, COOKIES, DOVER_FRAMES = threading.Lock(), threading.Lock(), {}, {}, {}  # SCORE: one scoring job at a time (Slide's score, a replace)
+LOCK, SCORE, TEXT, LOADED, COOKIES, DOVER_FRAMES, TEXT_ERR = threading.Lock(), threading.Lock(), threading.Lock(), {}, {}, {}, {}  # SCORE: one scoring job at a time (Slide's score, a replace); TEXT: one text search
 THUMBS = CACHE / "thumbs"  # Choose a video's icons: <hash of path+size+mtime>_<duration s>.jpg
 state = {"stage": "setup", "tries": TRIES, "threshold": THRESHOLD, "max_tries": MAX_TRIES}
 S = {"metas": {}, "readers": {}}  # per process: each video's probe + reader, the reel being edited
@@ -111,6 +112,7 @@ def fetch(link):  # Reel / Short link, or a video file -> templates/<id>/video.m
                 info = y.extract_info(link, download=False); d = TEMPLATES / info["id"]
                 if not (d / "video.mp4").exists(): y.process_ie_result(info, download=True)
         except yt_dlp.utils.DownloadError as e: raise RuntimeError(friendly(e)) from None
+        (d / "caption.txt").write_text(info.get("description") or "", encoding="utf-8")  # the post's caption, for Copy caption / Save reel
         info = {k: info.get(k) for k in ("id", "title", "uploader", "webpage_url")} | {"url": link}
     if not (a := d / "audio.wav").exists() or a.stat().st_mtime < (d / "video.mp4").stat().st_mtime:
         s = {x["codec_type"]: x for x in reversed(probe(d / "video.mp4")["streams"])}
@@ -147,11 +149,108 @@ def cuts(video):  # three detectors: colour-grid jump, PySceneDetect content, wi
     return {"video": Path(video).name, "fps": fps, "frames": len(grid), "min_shot_s": c["min_shot_s"], "cuts": out, "shots": [{"start_f": s, "end_f": e, "len_s": round((e - s) / fps, 3)} for s, e in zip(edges, edges[1:])]}
 
 
+def caption(d):  # the template post's caption (saved when it's downloaded; an older template reads it again from its link)
+    try:
+        if not (f := d / "caption.txt").is_file() and (u := json.loads((d / "source.json").read_text(encoding="utf-8")).get("webpage_url")): fetch(u)
+        return f.read_text(encoding="utf-8")
+    except Exception: return ""
+
+
 def template(link):  # the template folder + its cuts (detected again if the video or this script is newer, so CUT config changes bust the cache)
     with LOCK:
         d = fetch(link); cj = d / "cuts.json"
         if not cj.exists() or cj.stat().st_mtime < max((d / "video.mp4").stat().st_mtime, Path(__file__).stat().st_mtime): cj.write_text(json.dumps(cuts(d / "video.mp4"), indent=1))
         return d, json.loads(cj.read_text())
+
+
+def text_layer(d, step=3):  # the template's on-video text, lifted off its frames (exact font, size, place, timing): its pieces as see-through PNGs
+    import cv2  # in d/text/: text.json = {size, fps, sprites: [{png, x, y, w, h, frames: [[first, last], ...]}]} in the template's pixels and frames
+    j, src = d / "text" / "text.json", d / "video.mp4"
+    with TEXT:
+        if found(d): return json.loads(j.read_text())
+        if not (m := MODELS_DIR / Path(TEXTDET).name).is_file(): m.parent.mkdir(parents=True, exist_ok=True); __import__("urllib.request").request.urlretrieve(TEXTDET, m)
+        net = cv2.dnn.TextDetectionModel_DB(cv2.dnn.readNet(str(m))); W, H = 736, 1312
+        net.setBinaryThreshold(0.3); net.setPolygonThreshold(0.5); net.setUnclipRatio(2.0); net.setMaxCandidates(200); net.setInputSize((W, H))
+        net.setInputMean((123.675, 116.28, 103.53)); net.setInputScale(1 / 255 / np.array([0.229, 0.224, 0.225]))
+        def frames():
+            cap = cv2.VideoCapture(str(src))
+            while (f := cap.read()[1]) is not None: yield f
+        dets, fps, cut = {}, cv2.VideoCapture(str(src)).get(cv2.CAP_PROP_FPS), [0] + [c["frame"] for c in json.loads((d / "cuts.json").read_text())["cuts"]]
+        shot = lambda k: sum(c <= k for c in cut)  # text usually changes at a cut: a look never spans one
+        for k, f in enumerate(frames()):  # 1. text boxes every step frames; tiny ones are signs in the footage
+            h, w = f.shape[:2]
+            if k % step == 0: dets[k] = [b for p in map(np.array, net.detect(cv2.resize(f, (W, H)))[0]) if (b := [p[:, 0].min() * w / W, p[:, 1].min() * h / H, p[:, 0].max() * w / W, p[:, 1].max() * h / H])[3] - b[1] > 0.018 * h]
+        n = k + 1; ov = lambda a, b: max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        iou = lambda a, b: ov(a, b) / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - ov(a, b) + 1e-9); tr = []
+        for k, bs in dets.items():  # 2. lines: a box in about the same place on consecutive detections; a new look when it grows by a letter (typing) or at a cut
+            for b in bs:
+                t = next((t for t in tr if t["f1"] >= k - 3 * step and iou(t["looks"][-1]["b"], b) > 0.5), None)
+                if not t: tr.append(t := {"f0": k, "looks": []})
+                t["f1"] = k; L = t["looks"][-1] if t["looks"] else None
+                if L and shot(L["z"]) == shot(k) and abs((b[2] - b[0]) - (L["b"][2] - L["b"][0])) < 0.3 * (b[3] - b[1]): L["z"] = k; L["b"] = [min(L["b"][0], b[0]), min(L["b"][1], b[1]), max(L["b"][2], b[2]), max(L["b"][3], b[3])]
+                else: t["looks"].append({"a": k, "z": k, "b": b})
+        still = lambda t: max(abs(L["b"][i] - t["looks"][-1]["b"][i]) for L in t["looks"] for i in (1, 3)) < 0.01 * h  # captions keep their line; signs in the footage move
+        looks = [dict(L, line=i) for i, t in enumerate(t for t in tr if t["f1"] - t["f0"] >= 0.4 * fps and still(t)) for L in t["looks"]]
+        for L in looks: b, lh = L["b"], L["b"][3] - L["b"][1]; p = 0.3 * lh; L.update(r=[max(0, int(b[0] - p)), max(0, int(b[1] - p)), min(w, int(b[2] + p)), min(h, int(b[3] + p))], lh=lh, crops=[])
+        for k, f in enumerate(frames()):  # 3. each look's letters, from up to 30 of its frames
+            for L in looks:
+                if L["a"] <= k <= L["z"] and (k - L["a"]) % (1 + (L["z"] - L["a"]) // 30) == 0: x0, y0, x1, y1 = L["r"]; L["crops"].append(f[y0:y1, x0:x1])
+        for L in looks:  # bright thin strokes over a smooth background, that stay put while the scene behind them moves
+            cs = np.stack(L.pop("crops")).astype(np.float32); M = np.median(cs, 0); G = cv2.cvtColor(M, cv2.COLOR_BGR2GRAY); r = int(0.35 * L["lh"]) | 1
+            bg = cv2.morphologyEx(G, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))); top = G - bg
+            L["raw"] = core = (top > 40) & (M.min(2) > 150) & ((cs.std(0).max(2) < 15) if len(cs) >= 5 else True); L["ok"] = core.sum() > 0.01 * core.size
+            if not L["ok"]: continue
+            seed = core & (G > np.percentile(G[core], 95) - 20) & (M.max(2) - M.min(2) < 40)  # the text's own colour: the brightest, most even pixels
+            thin = cv2.erode(core.astype(np.uint8), np.ones((3, 3), np.uint8))  # pries apart bits of the scene that only touch a letter
+            nl, lab, st, cen = cv2.connectedComponentsWithStats(thin, connectivity=4); hits = np.bincount(lab[seed & thin.astype(bool)], minlength=nl); by = L["b"][1] - L["r"][1]
+            good = [i for i in range(1, nl) if hits[i] >= 0.3 * st[i, cv2.CC_STAT_AREA] and by - 0.1 * L["lh"] <= cen[i][1] <= by + 1.1 * L["lh"] and st[i, cv2.CC_STAT_HEIGHT] <= 1.3 * L["lh"]]
+            core = core & cv2.dilate(np.isin(lab, good).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)  # letters: shapes mostly in the text's colour, on its line
+            if core.sum() <= 0.01 * core.size: L["ok"] = False; continue
+            L["C"], CL = np.median(M[seed & core], 0), float(np.percentile(G[core], 90))
+            L["alpha"] = np.clip(top / np.maximum(CL - bg, 1), 0, 1) * (cv2.dilate(core.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0)
+            L["core"] = c = L["alpha"] > 0.6; L["Cm"] = float(np.median(G[c])); L["ring"] = cv2.dilate(c.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=2).astype(bool) & ~cv2.dilate(c.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+            L["ok"] = CL > 230 and (len(cs) < 3 or np.abs(cs.mean(3) - G)[:, c].mean() < 12)  # overlaid letters are solid and steady (a watermark is see-through)
+        def same(A, B):  # the same letters in the same place: their strokes overlap
+            x0, y0, x1, y1 = min(A["r"][0], B["r"][0]), min(A["r"][1], B["r"][1]), max(A["r"][2], B["r"][2]), max(A["r"][3], B["r"][3]); m = np.zeros((2, y1 - y0, x1 - x0), bool)
+            for i, L in enumerate((A, B)): m[i, L["r"][1] - y0:L["r"][3] - y0, L["r"][0] - x0:L["r"][2] - x0] = L["raw"]
+            return (m[0] & m[1]).sum() > 0.6 * min(m[0].sum(), m[1].sum())
+        looks = [L for L in looks if L["ok"] and sum(M["z"] - M["a"] + step for M in looks if same(L, M)) < 0.5 * n]  # a handle watermark: the same letters half the reel or more
+        for L in looks: L["frames"] = []
+        for k, f in enumerate(frames()):  # 4. each frame, each line: its fullest look whose letters are really there (exact start and end: cuts, typing)
+            best = {}
+            for L in looks:
+                if L["a"] - step < k < L["z"] + step and shot(k) == shot(L["a"]):
+                    x0, y0, x1, y1 = L["r"]; G = cv2.cvtColor(f[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32); c, g = np.median(G[L["core"]]), np.median(G[L["ring"]])
+                    if c - g > 25 and abs(c - L["Cm"]) < 30 and L["core"].sum() > best.get(L["line"], {"core": np.zeros(1)})["core"].sum(): best[L["line"]] = L
+            for L in best.values(): L["frames"].append(k)
+        shutil.rmtree(j.parent, ignore_errors=True); j.parent.mkdir(parents=True); sprites = []
+        for i, L in enumerate(L for L in looks if L["frames"]):  # imencode + write_bytes: cv2.imwrite can't take non-ASCII paths on Windows
+            (j.parent / f"s{i}.png").write_bytes(cv2.imencode(".png", np.dstack([np.broadcast_to(L["C"], L["alpha"].shape + (3,)), L["alpha"] * 255]).round().astype(np.uint8))[1].tobytes()); runs = []
+            for k in L["frames"]:
+                if runs and k == runs[-1][1] + 1: runs[-1][1] = k
+                else: runs.append([k, k])
+            sprites.append({"png": f"s{i}.png", "x": L["r"][0], "y": L["r"][1], "w": L["r"][2] - L["r"][0], "h": L["r"][3] - L["r"][1], "frames": runs})
+        j.write_text(json.dumps(t := {"size": [w, h], "fps": fps, "sprites": sprites})); return t
+
+
+def found(d): j = d / "text" / "text.json"; return j.is_file() and j.stat().st_mtime >= max((d / "video.mp4").stat().st_mtime, Path(__file__).stat().st_mtime)  # (found again when this script is newer)
+
+
+def text_status(d):  # for the viewer: the text's pieces, or "working" while they're found in the background (once per template)
+    if found(d): j = d / "text" / "text.json"; return {**json.loads(j.read_text()), "status": "ready", "v": int(j.stat().st_mtime)}
+    if d.name in TEXT_ERR: return {"status": "error", "msg": TEXT_ERR.pop(d.name)}
+    def run():
+        try: text_layer(d)
+        except Exception as e: traceback.print_exc(); TEXT_ERR[d.name] = last(e)
+    if not TEXT.locked(): threading.Thread(target=run, daemon=True).start()
+    return {"status": "working"}
+
+
+def burn(d, on, W, H, first, pre="null", post="null"):  # the on-video text over a W x H video (when on): (ffmpeg inputs, numbered from first; a filter graph [0:v] -> [v])
+    t = text_layer(d) if on else {"size": [W, H], "fps": 1, "sprites": []}; (w, h), sp = t["size"], t["sprites"]; s = max(W / w, H / h); ox, oy = (w * s - W) / 2, (h * s - H) / 2
+    g = f"[0:v]{pre}[v0];" + "".join(f"[{first + i}:v]scale=iw*{s:.5f}:-1[s{i}];[v{i}][s{i}]overlay={p['x'] * s - ox:.1f}:{p['y'] * s - oy:.1f}:format=auto:enable='"
+                  + "+".join(f"between(t,{a / t['fps']:.4f},{(b + 0.5) / t['fps']:.4f})" for a, b in p["frames"]) + f"'[v{i + 1}];" for i, p in enumerate(sp))
+    return sum((["-i", d / "text" / p["png"]] for p in sp), []), g + f"[v{len(sp)}]{post}[v]"
 
 
 # ---------------------------------------------------------------- scoring models
@@ -312,6 +411,12 @@ def value(key, raw, history=()):  # 0..1, equal weight for every model: how this
 
 
 # ---------------------------------------------------------------- filling the shots
+def choose():  # the system's folder dialog (Mac: Finder's, else Tk's, in a process of its own); "" if cancelled
+    cmd = ["osascript", "-e", "activate", "-e", 'POSIX path of (choose folder with prompt "Footage folder")'] if sys.platform == "darwin" else [sys.executable, "-c",
+           "import tkinter as t, tkinter.filedialog as f; r = t.Tk(); r.withdraw(); r.attributes('-topmost', 1); print(f.askdirectory(title='Footage folder', initialdir='~'))"]
+    return subprocess.run(cmd, capture_output=True, encoding="utf-8", env=os.environ | {"PYTHONIOENCODING": "utf-8"}).stdout.strip()
+
+
 def videos(folder): return sorted(p for p in Path(folder).rglob("*") if p.suffix.lower() in VIDEO_EXT and not p.name.startswith(".") and OUTPUT not in p.relative_to(folder).parts)  # all subfolders; skips hidden files + saved reels
 
 
@@ -320,7 +425,7 @@ def order(pool, rnd): return rnd.sample(pool, len(pool))  # ALL the videos as on
 
 def prefetch(link):  # as soon as a link is pasted: the template, its shot count and length (for the estimate)
     state["tpl"] = {"link": link, "status": "loading"}
-    try: d, T = template(link); state["tpl"] = {"link": link, "status": "ready", "shots": len(T["shots"]), "dur": round(T["frames"] / T["fps"], 2)}
+    try: d, T = template(link); state["tpl"] = {"link": link, "status": "ready", "shots": len(T["shots"]), "dur": round(T["frames"] / T["fps"], 2)}; text_status(d)  # its on-video text, found meanwhile
     except Exception as e: traceback.print_exc(); state["tpl"] = {"link": link, "status": "error", "msg": last(e)}
 
 
@@ -510,12 +615,16 @@ def save(reel):  # a new version of the reel (earlier versions are kept)
     state.update(stage="saved", url=url, path=str(out)); return out
 
 
-def export(reel):  # Save reel: the final reel + every shot as its own numbered clip (with its audio), in <footage>/template_reel_output/<reel id>/
+def export(reel, text=False):  # Save reel: the final reel + every shot as its own numbered clip (with its audio), in <footage>/template_reel_output/<reel id>/; text: with the on-video text
     data, d = editing(reel); src = d / data["video"]; out = Path(data["folder"]) / OUTPUT / src.stem; out.mkdir(parents=True, exist_ok=True)
-    busy("Saving the reel and its clips"); shutil.copyfile(src, out / src.name); cuts = [s["start_f"] for s in data["shots"][1:]]
-    ff(["-i", src, "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",  # keyframes half a frame early: land on frame f, never f+1
+    busy("Saving the reel and its clips" + (" with the on-video text" if text else "")); cuts = [s["start_f"] for s in data["shots"][1:]]
+    if text: ins, g = burn(d, True, 1080, 1920, 1); (gf := d / "text.graph.txt").write_text(g); ff(["-i", src, *ins, "-/filter_complex", gf, "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-crf", "18",
+               "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", out / src.name], "on-video text"); gf.unlink()
+    else: shutil.copyfile(src, out / src.name)
+    ff(["-i", out / src.name, "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",  # keyframes half a frame early: land on frame f, never f+1
         "-force_key_frames", ",".join(f"{(f - 0.5) / data['fps']:.5f}" for f in cuts), "-f", "segment", "-segment_frames", ",".join(map(str, cuts)),
         "-segment_start_number", "1", "-reset_timestamps", "1", out / f"{src.stem}_%02d.mp4"], "clips")
+    if c := caption(d): (out / "caption.txt").write_text(c, encoding="utf-8")
     state.update(stage="exported", folder=str(out), msg=""); return out
 
 
@@ -571,7 +680,7 @@ def rife():  # RIFE 4.26 (Practical-RIFE's IFNet_HDv3): net(a, b, t) = the frame
     w = {k.removeprefix("module."): v for k, v in torch.load(f, map_location="cpu").items()}; net = Net(); net.load_state_dict({k: w[k] for k in net.state_dict()}); return net.eval()
 
 
-def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos (same cuts, 60 fps at least), then 2160x3840 three times, next to Save reel's files:
+def make4k(reel, text=False):  # Make 4K: a lossless 1080p render from your original videos (same cuts, 60 fps at least), then 2160x3840 three times (text: with the on-video text), next to Save reel's files:
     import cv2, torch  # _4k_plain (lanczos), _4k_ai (Real-ESRGAN 2x, blended with the plain one, light grain), _4k_ai_smooth (the same, with RIFE's in-between frames where a slower clip repeats one). The Mac's GPU when there is one
     data, d = editing(reel); src = d / data["video"]; out = Path(data["folder"]) / OUTPUT / src.stem; out.mkdir(parents=True, exist_ok=True); fps = max(data["fps"], 60)
     shots = [{**s, "start_f": round(s["start_f"] * fps / data["fps"]), "end_f": round(s["end_f"] * fps / data["fps"])} for s in data["shots"]]  # the cuts at that rate
@@ -579,15 +688,17 @@ def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos 
     c = next(s for s in probe(tmp)["streams"] if s["codec_type"] == "video")  # its colour tags, kept on both 4K files
     col = [x for k, o in (("color_range", "-color_range"), ("color_space", "-colorspace"), ("color_primaries", "-color_primaries"), ("color_transfer", "-color_trc")) if c.get(k) not in (None, "unknown") for x in (o, c[k])]
     enc = lambda name: ["-c:v", "libx264", "-crf", K4["crf"], "-preset", "medium", "-pix_fmt", "yuv420p", *col, "-c:a", "copy", "-movflags", "+faststart", out / f"{src.stem}_{name}.mp4"]
-    busy("4K (plain): upscaling"); ff(["-i", tmp, "-vf", "scale=2160:3840:flags=lanczos", *enc("4k_plain")], "4K plain")
+    ins, g = burn(d, text, 2160, 3840, 1, pre="scale=2160:3840:flags=lanczos"); (gf := d / "text.graph.txt").write_text(g)
+    busy("4K (plain): upscaling"); ff(["-i", tmp, *ins, "-/filter_complex", gf, "-map", "[v]", "-map", "0:a", *enc("4k_plain")], "4K plain")
     dev = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"; half = dev != "cpu"
     busy("4K (AI): loading Real-ESRGAN and RIFE"); net = esrgan().to(dev); net = net.half() if half else net; mid = rife().to(dev)
     n = sum(lens := [s["end_f"] - s["start_f"] for s in shots]); cuts = set(np.cumsum(lens).tolist())  # each shot's first frame
     rgb = f"scale=out_color_matrix={ {'bt470bg': 'bt470'}.get(c.get('color_space'), c.get('color_space') or 'bt709')}:out_range={c.get('color_range') or 'tv'},format=yuv420p,noise=alls={K4['grain']}:allf=t,setparams=" + ":".join(  # raw RGB carries no colour tags: set them
         f"{p}={c[k]}" for k, p in (("color_range", "range"), ("color_primaries", "color_primaries"), ("color_transfer", "color_trc"), ("color_space", "colorspace")) if c.get(k) not in (None, "unknown"))
     dec = subprocess.Popen([binary("ffmpeg"), "-v", "error", "-i", str(tmp), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    ins, g = burn(d, text, 2160, 3840, 2, post=rgb); gf.write_text(g)
     pipe = lambda name: subprocess.Popen([binary("ffmpeg"), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "2160x3840", "-r", str(fps), "-i", "-", "-i", str(tmp),
-                               "-map", "0:v", "-map", "1:a", "-vf", rgb, *map(str, enc(name))], stdin=subprocess.PIPE)
+                               *map(str, ins), "-/filter_complex", str(gf), "-map", "[v]", "-map", "1:a", *map(str, enc(name))], stdin=subprocess.PIPE)
     outs, t0, gpu = [pipe("4k_ai"), pipe("4k_ai_smooth")], time.time(), lambda a: torch.from_numpy(a).to(dev).permute(2, 0, 1)[None].float() / 255
     byte = lambda y: (y.clamp(0, 1) * 255).round().byte()[0].permute(1, 2, 0).contiguous().cpu().numpy()
     def up(f):  # a 1080x1920 frame -> its AI 4K one: Real-ESRGAN x4, then exactly half, blended with lanczos
@@ -606,7 +717,7 @@ def make4k(reel):  # Make 4K: a lossless 1080p render from your original videos 
                 flush(None if k in cuts else f); y = up(f); [o.stdin.write(y) for o in outs]; prev, rep = (f, y), 0; left = (time.time() - t0) / (k + 1) * (n - k - 1)
                 busy(f"4K (AI + smooth): frame {k + 1} / {n} · about {int(left // 60)} min {int(left % 60):02d} s left")
             flush(None)
-    finally: [o.stdin.close() for o in outs]; dec.kill(); [o.wait() for o in outs]; tmp.unlink(missing_ok=True)
+    finally: [o.stdin.close() for o in outs]; dec.kill(); [o.wait() for o in outs]; tmp.unlink(missing_ok=True); gf.unlink(missing_ok=True)
     if any(o.returncode for o in outs): raise RuntimeError("4K (AI): the encode failed")
     state.update(stage="exported", folder=str(out), msg=""); return out
 
@@ -626,6 +737,7 @@ class H(SimpleHTTPRequestHandler):
         if q[0] == "/count":
             if not str(f := Path(a.get("path", "").strip().strip('"'))).strip(". ") or not f.is_dir(): return self.reply({"error": "not a folder"})
             vs = videos(f); return self.reply({"videos": len(vs), "folders": len({v.parent for v in vs})})
+        if q[0] == "/choose": return self.reply({"path": choose()})
         if q[0] == "/models": return self.reply(model_info())
         if q[0] == "/estimate": return self.reply(estimate(int(a["shots"]), int(a["tries"]), float(a["threshold"]), max(1, int(a["videos"])),
                                                            [k for k in a.get("models", "current").split(",") if k in MODELS] or ["current"]))
@@ -633,6 +745,8 @@ class H(SimpleHTTPRequestHandler):
             return self.reply(VIEW.replace("/*DATA*/null", j.read_text()), "text/html; charset=utf-8")
         if q[0].startswith("/t/"): return self.send_file(TEMPLATES / q[0][3:])
         try:  # Choose a video: the grid's list, one icon (made on first ask)
+            if q[0] == "/caption": return self.reply({"text": caption((TEMPLATES / a["reel"]).parent)})
+            if q[0] == "/text": return self.reply(text_status((TEMPLATES / a["reel"]).parent))  # On-video text: its pieces once found
             if q[0] == "/list": return self.reply(grid(a["reel"], int(a["shot"])))
             if q[0] == "/thumb": return self.reply(tile(thumb(S["grid"][int(a["i"])])))
             if q[0] == "/slide": return self.reply(slide(a["reel"], int(a["shot"]), int(a["i"])))  # Slide: open a video, score a window
@@ -651,7 +765,7 @@ class H(SimpleHTTPRequestHandler):
         if route == "/keep" and "pending" not in S: return self.reply({"error": "nothing to keep"})
         job = {"/start": lambda: build(a["link"].strip(), Path(a["folder"].strip().strip('"')), int(a["tries"]), float(a["threshold"]),
                                        [k for k in a.get("models", ["current"]) if k in MODELS] or ["current"]),
-               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", ""), start=float(a.get("start", 0))), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"]), "/4k": lambda: make4k(a["reel"])}[route]
+               "/replace": lambda: replace(a["reel"], int(a["shot"]), a["mode"], a.get("path", ""), start=float(a.get("start", 0))), "/keep": lambda: keep(int(a.get("tab", 0))), "/export": lambda: export(a["reel"], bool(a.get("text"))), "/4k": lambda: make4k(a["reel"], bool(a.get("text")))}[route]
         def run():
             try:
                 with SCORE: job()  # waits for a Slide score in flight: they share the decoders and models
@@ -675,7 +789,7 @@ class H(SimpleHTTPRequestHandler):
 PAGE = r"""<!doctype html><meta charset="utf-8"><title>Template reel</title>
 <style>
 body{margin:0;font:14px system-ui,sans-serif;background:#111;color:#eee;display:grid;place-items:center;min-height:100vh} main{width:min(520px,92vw);display:flex;flex-direction:column;gap:16px} h1{font-size:18px;font-weight:600;margin:0}
-label{display:flex;flex-direction:column;gap:5px;color:#aaa;font-size:12px} input[type=text]{background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:8px;padding:9px 11px;font-size:14px} input:focus{outline:none;border-color:#e67e22}
+label,.f{display:flex;flex-direction:column;gap:5px;color:#aaa;font-size:12px} #choose{background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:8px;font-weight:400;text-align:left;padding:9px 11px} summary{color:#777;font-size:11px;cursor:pointer} input[type=text]{background:#1b1b1b;color:#eee;border:1px solid #333;border-radius:8px;padding:9px 11px;font-size:14px} input:focus{outline:none;border-color:#e67e22}
 small{color:#777;min-height:15px;font-size:11px} .bad{color:#e74c3c} .ok{color:#8c8} .sl{display:flex;flex-direction:column;gap:3px} .sl .top,.models .top{display:flex;justify-content:space-between;color:#aaa;font-size:12px} .sl b{color:#f5b041;font-weight:600}
 input[type=range]{accent-color:#e67e22;width:100%;margin:2px 0} .ends{display:flex;justify-content:space-between;color:#555;font-size:10px} #eta{color:#ccc;font-size:13px;text-align:center;min-height:18px} #eta b{color:#f5b041}
 .models{display:flex;flex-direction:column;gap:2px} .models a{color:#f5b041;cursor:pointer;font-size:11px} .m{display:grid;grid-template-columns:18px 118px 1fr 74px 52px;gap:6px;align-items:center;font-size:12px;padding:3px 4px;border-radius:6px;cursor:pointer} .m:hover{background:#1b1b1b}
@@ -686,7 +800,8 @@ button{background:linear-gradient(90deg,#f5b041,#e67e22);color:#111;border:0;bor
 <main>
 <h1>Template reel</h1>
 <label>Instagram Reel or YouTube Short link<input type="text" id="link" placeholder="https://www.instagram.com/reel/..." autofocus><small id="tpl"></small></label>
-<label>Footage folder (all subfolders are searched)<input type="text" id="folder" placeholder="paste the folder path"><small id="count"></small></label>
+<div class="f">Footage folder (all subfolders are searched)<button id="choose">Choose folder…</button><small id="count"></small>
+  <details><summary>or paste a path</summary><input type="text" id="folder" placeholder="paste the folder path" style="width:100%;box-sizing:border-box;margin-top:5px"></details></div>
 <div class="models"><div class="top"><span>Scoring models (equal weight; tick one or more)</span><a id="vbench">VBench set</a></div><div id="mlist"></div>
   <small>Accuracy: each model's published agreement with human ratings, from different benchmarks, so a rough guide. Time: per try on this computer.</small></div>
 <div class="sl"><div class="top"><span>Tries per video</span><b id="triesV"></b></div><input type="range" id="tries" min="1" step="1">
@@ -716,9 +831,11 @@ fetch('/models').then(r => r.json()).then(ms => { $('#mlist').innerHTML = ms.map
 $('#vbench').onclick = () => { document.querySelectorAll('#mlist input').forEach(c => c.checked = ['laion_aes', 'musiq-spaq'].includes(c.value)); eta(); };
 $('#link').oninput = () => { clearTimeout(timer); timer = setTimeout(() => { const l = $('#link').value.trim();
   if (/^https?:\/\//.test(l)) fetch('/template', {method: 'POST', body: JSON.stringify({link: l})}); }, 400); ready(); };
-$('#folder').oninput = () => { clearTimeout(ftimer); folder = null; ready(); eta(); ftimer = setTimeout(async () => {
-  const c = await (await fetch('/count?path=' + encodeURIComponent($('#folder').value))).json(); folder = c.error ? null : c;
-  $('#count').className = folder?.videos ? 'ok' : 'bad'; $('#count').textContent = c.error || `${c.videos} videos in ${c.folders} folder(s)`; ready(); eta(); }, 300); };
+$('#folder').oninput = () => { clearTimeout(ftimer); folder = null; ready(); eta(); ftimer = setTimeout(async () => { const p = $('#folder').value.trim();
+  const c = await (await fetch('/count?path=' + encodeURIComponent(p))).json(); folder = c.error ? null : c;
+  $('#count').className = folder?.videos ? 'ok' : 'bad'; $('#count').textContent = p && `${p} · ` + (c.error || `${c.videos} videos in ${c.folders} folder(s)`); ready(); eta(); }, 300); };
+$('#choose').onclick = async () => { $('#choose').disabled = true; const r = await (await fetch('/choose')).json(); $('#choose').disabled = false;  // the system's folder dialog
+  if (r.path) { $('#folder').value = r.path; $('#folder').oninput(); } };
 async function poll() {  // the server's state, twice a second
   const s = await (await fetch('/status')).json(), tplChanged = JSON.stringify(s.tpl) !== JSON.stringify(S.tpl); S = s;
   if (s.stage === 'done' && started) return location.href = s.url;
@@ -754,19 +871,20 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 .v{min-width:0;display:flex;flex-direction:column;align-items:center;gap:5px;padding:6px;border-radius:8px;cursor:pointer;font-size:11px;color:#aaa;user-select:none}
 .v .im{position:relative;width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#1b1b1b;border-radius:6px;color:#666} .v img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .v span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .v.on{background:#e67e2240;color:#fff} .v.cur .im{outline:2px solid #f5b041;outline-offset:2px} .v.short{opacity:.3}
-#lv,#sv{flex:1;min-height:0;width:100%;object-fit:contain}
+#lv,#sv{flex:1;min-height:0;width:100%;object-fit:contain} #L{position:relative} #ov{position:absolute;pointer-events:none;overflow:hidden} #ov img{position:absolute}
 </style>
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
 <label><input type="checkbox" id="loop" checked> Loop shot</label><button id="all">Play whole reel</button><button id="rep" hidden>Replace clip</button>
-<button id="export" class="hot" hidden>Save reel</button>
+<button id="export" class="hot" hidden>Save reel</button><button id="capt" hidden title="The template post's caption, to paste under your reel (Save reel also writes it as caption.txt)">Copy caption</button><label id="txl" hidden title="The template's own on-video text: same font, place and timing. Only shows or hides it; Save reel and Make 4K follow this box">
+<input type="checkbox" id="tx" checked> <span id="txn">On-video text</span></label>
 <button id="k4" hidden title="From your original videos: plain, AI and AI smooth (60 fps) 4K versions, next to Save reel's files (Mac: ~30-50 min)">Make 4K</button><span id="info"></span></div>
 <div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button id="slideSame">Slide same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
   <button id="x">✕</button></span>
   <span id="msg"></span><span id="decide" hidden><button id="keep" class="hot">Keep new</button><button id="againSame">Try again: same video</button>
   <button id="againRand">Try again: random video</button><button class="browse">Try again: choose a video</button><button id="cancel">Cancel</button></span></div>
 <div id="stage"><figure id="L"><div class="cap" hidden><b>Current</b><span id="lcap"></span><button id="lplay">▶ Play</button><label><input type="checkbox" id="lloop"> Loop</label></div>
-  <video id="player" playsinline></video></figure>
+  <video id="player" playsinline></video><div id="ov" hidden></div></figure>
   <figure id="R" hidden><div class="cap"><b>New</b><span id="rcap"></span><button id="rplay">▶ Play</button><label><input type="checkbox" id="rloop"> Loop</label></div>
   <div id="tabs"></div><video id="cand" playsinline></video></figure></div>
 <div id="grid" hidden><div id="gbar"><span id="gn"></span><label>Icon size <input type="range" id="gsize" min="120" max="480" step="10"></label>
@@ -796,8 +914,26 @@ setInterval(() => {  // a timer, not rAF: rAF stops when the page isn't painted
   guard(s => P.currentTime >= T(s.end_f) - 0.3 / D.fps);
   if (whole) { const k = D.shots.findIndex(s => P.currentTime < T(s.end_f)); if (k >= 0 && k !== cur) { cur = k; mark(k); } }
   $('#head').style.left = `${100 * P.currentTime / T(D.frames)}%`;
-  $('#lplay').textContent = P.paused ? '▶ Play' : '❚❚ Pause'; $('#rplay').textContent = Q.paused ? '▶ Play' : '❚❚ Pause';
+  $('#lplay').textContent = P.paused ? '▶ Play' : '❚❚ Pause'; $('#rplay').textContent = Q.paused ? '▶ Play' : '❚❚ Pause'; txDraw();
 }, 10);
+// ---- On-video text: the template's text pieces (see-through PNGs) drawn over the player at their frames; the box only shows or hides them
+let TX = null; const txKey = 'text:' + D.template, txOn = () => !!TX && $('#tx').checked;
+function txDraw() {
+  const ov = $('#ov'); if (!txOn()) return ov.hidden = true; ov.hidden = false;
+  const r = P.getBoundingClientRect(), f = $('#L').getBoundingClientRect(), vw = P.videoWidth || 1080, vh = P.videoHeight || 1920, k = Math.min(r.width / vw, r.height / vh);
+  Object.assign(ov.style, {left: `${r.left - f.left + (r.width - vw * k) / 2}px`, top: `${r.top - f.top + (r.height - vh * k) / 2}px`, width: `${vw * k}px`, height: `${vh * k}px`});
+  const [w, h] = TX.size, s = Math.max(vw / w, vh / h), ox = (w * s - vw) / 2, oy = (h * s - vh) / 2, fr = Math.floor(P.currentTime * TX.fps + 1e-3);  // the reel and the template share frames
+  [...ov.children].forEach((im, i) => { const p = TX.sprites[i]; im.style.display = p.frames.some(([a, b]) => a <= fr && fr <= b) ? '' : 'none';
+    Object.assign(im.style, {left: `${(p.x * s - ox) / vw * 100}%`, top: `${(p.y * s - oy) / vh * 100}%`, width: `${p.w * s / vw * 100}%`}); });
+}
+function txLoad() {  // found once per template, in the background (a minute or two the first time)
+  fetch(`/text?reel=${encodeURIComponent(reel)}`).then(r => r.json()).then(t => {
+    if (t.status === 'working') { $('#txl').hidden = false; $('#tx').disabled = true; $('#txn').textContent = 'Finding the on-video text…'; return setTimeout(txLoad, 3000); }
+    if (!t.sprites?.length) return $('#txl').hidden = true;
+    TX = t; $('#ov').innerHTML = t.sprites.map(p => `<img src="/t/${D.template}/text/${p.png}?v=${t.v}" alt="">`).join('');
+    try { $('#tx').checked = localStorage[txKey] !== 'off'; } catch {} $('#tx').disabled = false; $('#txn').textContent = 'On-video text'; $('#txl').hidden = false; });
+}
+$('#tx').onchange = () => { try { localStorage[txKey] = $('#tx').checked ? 'on' : 'off'; } catch {} };
 function pick(i, play = true) {
   cur = Math.max(0, Math.min(D.shots.length - 1, i)); whole = false; const s = D.shots[cur], c = D.cuts[cur - 1];
   seek(s.start_f); if (play) P.play().catch(() => {}); mark(cur);
@@ -921,12 +1057,17 @@ $('#slideSame').onclick = () => slide(); $('#gslide').onclick = $('#lslide').onc
 $('#rep').onclick = () => ui(true, false); $('#x').onclick = () => ui(false, false);
 $('#againSame').onclick = () => replace('same', pend.cs[pend.tab].src);  // 5 more moments of the current tab's video
 $('#againRand').onclick = () => replace('random');
-$('#export').onclick = () => post('/export', {reel}).then(() => wait(s => ui(false, false, `Saved: ${s.folder}`)));
-$('#k4').onclick = () => post('/4k', {reel}).then(() => wait(s => ui(false, false, `4K saved (plain, AI, AI smooth): ${s.folder}`)));
+$('#export').onclick = () => post('/export', {reel, text: txOn()}).then(() => wait(s => ui(false, false, `Saved: ${s.folder}`)));
+$('#k4').onclick = () => post('/4k', {reel, text: txOn()}).then(() => wait(s => ui(false, false, `4K saved (plain, AI, AI smooth): ${s.folder}`)));
+let caption = '';  // fetched now: the clipboard only takes a copy made right at the click
+$('#capt').onclick = () => { const t = Object.assign(document.createElement('textarea'), {value: caption}); document.body.append(t); t.select();
+  (navigator.clipboard?.writeText(caption) ?? Promise.reject()).catch(() => document.execCommand('copy')).finally(() => t.remove());
+  $('#capt').textContent = 'Copied ✓'; setTimeout(() => $('#capt').textContent = 'Copy caption', 1500); };
 $('#cancel').onclick = () => post('/cancel', {}).then(() => { compare(null); ui(false, false); pick(cur); });
 $('#keep').onclick = () => { const i = pend.i; post('/keep', {tab: pend.tab}).then(() => wait(s => location.href = `${s.url}#shot=${i + 1}`)); };
 pick((+location.hash.split('shot=')[1] || 1) - 1, false);
 if (location.protocol.startsWith('http') && D.template) { $('#rep').hidden = $('#export').hidden = $('#k4').hidden = false;  // after a reload: a proposal still waiting, or a job still running
+  fetch(`/caption?reel=${encodeURIComponent(reel)}`).then(r => r.json()).then(r => { caption = r.text || ''; $('#capt').hidden = !caption.trim(); }); txLoad();
   fetch('/status').then(r => r.json()).then(s => s.stage === 'preview' && s.reel === reel ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0}))
     : s.stage === 'working' && wait(s => s.stage === 'preview' ? (pick(s.shot, false), compare({i: s.shot, cs: s.cands, tab: 0})) : location.href = s.url)); }
 </script>
