@@ -176,50 +176,67 @@ def text_layer(d, step=3):  # the template's on-video text, lifted off its frame
             cap = cv2.VideoCapture(str(src))
             while (f := cap.read()[1]) is not None: yield f
         dets, fps, cut = {}, cv2.VideoCapture(str(src)).get(cv2.CAP_PROP_FPS), [0] + [c["frame"] for c in json.loads((d / "cuts.json").read_text())["cuts"]]
-        shot = lambda k: sum(c <= k for c in cut)  # text usually changes at a cut: a look never spans one
+        shot = lambda k: sum(c <= k for c in cut)  # text usually changes at a cut: a look never spans one (one caption's pieces are joined later)
+        def sig(f, b):  # a box's bright strokes, where they are in the frame: the same letters as last time? (a font switch keeps the box, not the strokes)
+            x0, y0 = max(0, int(b[0])), max(0, int(b[1])); c = f[y0:int(b[3]), x0:int(b[2])]; g = cv2.cvtColor(c, cv2.COLOR_BGR2GRAY).astype(np.float32); r = int(0.35 * (b[3] - b[1])) | 1
+            return x0, y0, (g - cv2.morphologyEx(g, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))) > 40) & (c.min(2) > 150)
+        def alike(s, t):  # the share of two sigs' strokes in the same place
+            x0, y0 = min(s[0], t[0]), min(s[1], t[1]); m = np.zeros((2, max(s[1] + s[2].shape[0], t[1] + t[2].shape[0]) - y0, max(s[0] + s[2].shape[1], t[0] + t[2].shape[1]) - x0), bool)
+            for i, (x, y, a) in enumerate((s, t)): m[i, y - y0:y - y0 + a.shape[0], x - x0:x - x0 + a.shape[1]] = a
+            return (m[0] & m[1]).sum() / ((m[0] | m[1]).sum() + 1)
         for k, f in enumerate(frames()):  # 1. text boxes every step frames; tiny ones are signs in the footage
             h, w = f.shape[:2]
-            if k % step == 0: dets[k] = [b for p in map(np.array, net.detect(cv2.resize(f, (W, H)))[0]) if (b := [p[:, 0].min() * w / W, p[:, 1].min() * h / H, p[:, 0].max() * w / W, p[:, 1].max() * h / H])[3] - b[1] > 0.018 * h]
+            if k % step == 0: dets[k] = [(b, sig(f, b)) for p in map(np.array, net.detect(cv2.resize(f, (W, H)))[0]) if (b := [p[:, 0].min() * w / W, p[:, 1].min() * h / H, p[:, 0].max() * w / W, p[:, 1].max() * h / H])[3] - b[1] > 0.018 * h]
         n = k + 1; ov = lambda a, b: max(0, min(a[2], b[2]) - max(a[0], b[0])) * max(0, min(a[3], b[3]) - max(a[1], b[1]))
         iou = lambda a, b: ov(a, b) / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - ov(a, b) + 1e-9); tr = []
         for k, bs in dets.items():  # 2. lines: a box in about the same place on consecutive detections; a new look when it grows by a letter (typing) or at a cut
-            for b in bs:
+            for b, s in bs:
                 t = next((t for t in tr if t["f1"] >= k - 3 * step and iou(t["looks"][-1]["b"], b) > 0.5), None)
                 if not t: tr.append(t := {"f0": k, "looks": []})
                 t["f1"] = k; L = t["looks"][-1] if t["looks"] else None
-                if L and shot(L["z"]) == shot(k) and abs((b[2] - b[0]) - (L["b"][2] - L["b"][0])) < 0.3 * (b[3] - b[1]): L["z"] = k; L["b"] = [min(L["b"][0], b[0]), min(L["b"][1], b[1]), max(L["b"][2], b[2]), max(L["b"][3], b[3])]
-                else: t["looks"].append({"a": k, "z": k, "b": b})
-        still = lambda t: max(abs(L["b"][i] - t["looks"][-1]["b"][i]) for L in t["looks"] for i in (1, 3)) < 0.01 * h  # captions keep their line; signs in the footage move
+                if L and shot(L["z"]) == shot(k) and abs((b[2] - b[0]) - (L["b"][2] - L["b"][0])) < 0.3 * (b[3] - b[1]) and alike(s, L["s"]) > 0.5:
+                    L["z"], L["s"], L["bz"] = k, s, b; L["mv"] = max(L["mv"], abs(b[1] + b[3] - L["b0"][1] - L["b0"][3]) / 2); L["b"] = [min(L["b"][0], b[0]), min(L["b"][1], b[1]), max(L["b"][2], b[2]), max(L["b"][3], b[3])]
+                else: t["looks"].append({"a": k, "z": k, "b": b, "b0": b, "bz": b, "mv": 0, "s": s})  # (a font switching every few frames: a look per font)
+        mid = lambda L: (L["b"][1] + L["b"][3]) / 2  # captions keep their line (a new font may sit a little higher or lower); signs in the footage move
+        still = lambda t: max(L["mv"] for L in t["looks"]) < 0.01 * h and max(map(mid, t["looks"])) - min(map(mid, t["looks"])) < 0.5 * np.median([L["b"][3] - L["b"][1] for L in t["looks"]])
         looks = [dict(L, line=i) for i, t in enumerate(t for t in tr if t["f1"] - t["f0"] >= 0.4 * fps and still(t)) for L in t["looks"]]
         for L in looks: b, lh = L["b"], L["b"][3] - L["b"][1]; p = 0.3 * lh; L.update(r=[max(0, int(b[0] - p)), max(0, int(b[1] - p)), min(w, int(b[2] + p)), min(h, int(b[3] + p))], lh=lh, crops=[])
-        for k, f in enumerate(frames()):  # 3. each look's letters, from up to 30 of its frames
+        for k, f in enumerate(frames()):  # 3. each look's letters, from up to 30 of its frames (and the ones up to the next detection with the same strokes: a font shown 3 frames gets all 3)
             for L in looks:
-                if L["a"] <= k <= L["z"] and (k - L["a"]) % (1 + (L["z"] - L["a"]) // 30) == 0: x0, y0, x1, y1 = L["r"]; L["crops"].append(f[y0:y1, x0:x1])
+                if L["a"] <= k < L["z"] + step and shot(k) == shot(L["a"]) and (k - L["a"]) % (1 + (L["z"] - L["a"]) // 30) == 0 and (k <= L["z"] or alike(sig(f, L["bz"]), L["s"]) > 0.5): x0, y0, x1, y1 = L["r"]; L["crops"].append(f[y0:y1, x0:x1])
+        fin = lambda L: L.update(core=(c := L["alpha"] > 0.6), ring=cv2.dilate(c.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=2).astype(bool) & ~cv2.dilate(c.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool))
         for L in looks:  # bright thin strokes over a smooth background, that stay put while the scene behind them moves
             cs = np.stack(L.pop("crops")).astype(np.float32); M = np.median(cs, 0); G = cv2.cvtColor(M, cv2.COLOR_BGR2GRAY); r = int(0.35 * L["lh"]) | 1
             bg = cv2.morphologyEx(G, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r, r))); top = G - bg
             L["raw"] = core = (top > 40) & (M.min(2) > 150) & ((cs.std(0).max(2) < 15) if len(cs) >= 5 else True); L["ok"] = core.sum() > 0.01 * core.size
             if not L["ok"]: continue
-            seed = core & (G > np.percentile(G[core], 95) - 20) & (M.max(2) - M.min(2) < 40)  # the text's own colour: the brightest, most even pixels
+            br = core & (G > np.percentile(G[core], 95) - 20); seed = br & (np.abs(M - np.median(M[br], 0)).max(2) < 40)  # the text's own colour (white, cream, pale pink...): its brightest pixels and those like them
             thin = cv2.erode(core.astype(np.uint8), np.ones((3, 3), np.uint8))  # pries apart bits of the scene that only touch a letter
             nl, lab, st, cen = cv2.connectedComponentsWithStats(thin, connectivity=4); hits = np.bincount(lab[seed & thin.astype(bool)], minlength=nl); by = L["b"][1] - L["r"][1]
             good = [i for i in range(1, nl) if hits[i] >= 0.3 * st[i, cv2.CC_STAT_AREA] and by - 0.1 * L["lh"] <= cen[i][1] <= by + 1.1 * L["lh"] and st[i, cv2.CC_STAT_HEIGHT] <= 1.3 * L["lh"]]
             core = core & cv2.dilate(np.isin(lab, good).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)  # letters: shapes mostly in the text's colour, on its line
-            if core.sum() <= 0.01 * core.size: L["ok"] = False; continue
+            if core.sum() <= 0.01 * core.size or max([st[i, cv2.CC_STAT_HEIGHT] for i in good], default=0) < 0.4 * L["lh"]: L["ok"] = False; continue  # (a line's letters fill its box: bright bits behind dark text don't)
             L["C"], CL = np.median(M[seed & core], 0), float(np.percentile(G[core], 90))
             L["alpha"] = np.clip(top / np.maximum(CL - bg, 1), 0, 1) * (cv2.dilate(core.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=2) > 0)
-            L["core"] = c = L["alpha"] > 0.6; L["Cm"] = float(np.median(G[c])); L["ring"] = cv2.dilate(c.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=2).astype(bool) & ~cv2.dilate(c.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-            L["ok"] = CL > 230 and (len(cs) < 3 or np.abs(cs.mean(3) - G)[:, c].mean() < 12)  # overlaid letters are solid and steady (a watermark is see-through)
-        def same(A, B):  # the same letters in the same place: their strokes overlap
-            x0, y0, x1, y1 = min(A["r"][0], B["r"][0]), min(A["r"][1], B["r"][1]), max(A["r"][2], B["r"][2]), max(A["r"][3], B["r"][3]); m = np.zeros((2, y1 - y0, x1 - x0), bool)
-            for i, L in enumerate((A, B)): m[i, L["r"][1] - y0:L["r"][3] - y0, L["r"][0] - x0:L["r"][2] - x0] = L["raw"]
-            return (m[0] & m[1]).sum() > 0.6 * min(m[0].sum(), m[1].sum())
+            fin(L); c = L["core"]; L["Cm"] = float(np.median(G[c]))
+            L["ok"] = CL > 230 and (len(cs) < 3 or np.abs(cs.mean(3) - G)[:, c].mean() < 16)  # overlaid letters are solid and steady (a watermark is see-through)
+        box = lambda A, B: [min(A["r"][0], B["r"][0]), min(A["r"][1], B["r"][1]), max(A["r"][2], B["r"][2]), max(A["r"][3], B["r"][3])]
+        def put(L, k, r):  # L's k (raw / alpha) on the frame area r
+            m = np.zeros((r[3] - r[1], r[2] - r[0]), L[k].dtype); m[L["r"][1] - r[1]:L["r"][3] - r[1], L["r"][0] - r[0]:L["r"][2] - r[0]] = L[k]; return m
+        def same(A, B, both=False):  # the same letters in the same place: their strokes overlap (both: their cleaned letters, each mostly the other's: not a thin font inside a bold one)
+            a, b = put(A, k := "core" if both else "raw", r := box(A, B)), put(B, k, r); return (a & b).sum() > 0.6 * (max if both else min)(a.sum(), b.sum())
         looks = [L for L in looks if L["ok"] and sum(M["z"] - M["a"] + step for M in looks if same(L, M)) < 0.5 * n]  # a handle watermark: the same letters half the reel or more
+        joined = []
+        for B in sorted(looks, key=lambda L: L["a"]):  # one caption over a cut: its pieces joined, keeping only the strokes seen over both scenes (a speck is one scene's)
+            if A := next((A for A in joined if A["line"] == B["line"] and max(A["shots"]) + 1 == shot(B["a"]) and B["a"] - A["z"] <= step and same(A, B, True)), None):
+                r = box(A, B); A.update(alpha=np.minimum(put(A, "alpha", r), put(B, "alpha", r)), raw=put(A, "raw", r) & put(B, "raw", r), r=r, z=B["z"], shots=A["shots"] | {shot(B["a"])}, Cm=(A["Cm"] + B["Cm"]) / 2); fin(A)
+            else: joined.append(dict(B, shots={shot(B["a"])}))
+        looks = joined
         for L in looks: L["frames"] = []
         for k, f in enumerate(frames()):  # 4. each frame, each line: its fullest look whose letters are really there (exact start and end: cuts, typing)
             best = {}
             for L in looks:
-                if L["a"] - step < k < L["z"] + step and shot(k) == shot(L["a"]):
+                if L["a"] - step <= k < L["z"] + step and shot(k) in L["shots"]:
                     x0, y0, x1, y1 = L["r"]; G = cv2.cvtColor(f[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32); c, g = np.median(G[L["core"]]), np.median(G[L["ring"]])
                     if c - g > 25 and abs(c - L["Cm"]) < 30 and L["core"].sum() > best.get(L["line"], {"core": np.zeros(1)})["core"].sum(): best[L["line"]] = L
             for L in best.values(): L["frames"].append(k)
@@ -236,8 +253,11 @@ def text_layer(d, step=3):  # the template's on-video text, lifted off its frame
 def found(d): j = d / "text" / "text.json"; return j.is_file() and j.stat().st_mtime >= max((d / "video.mp4").stat().st_mtime, Path(__file__).stat().st_mtime)  # (found again when this script is newer)
 
 
+def dropped(d): f = d / "text" / "drop.json"; return set(json.loads(f.read_text())) if f.is_file() else set()  # the text pieces you unticked (gone with the pieces when they're found again)
+
+
 def text_status(d):  # for the viewer: the text's pieces, or "working" while they're found in the background (once per template)
-    if found(d): j = d / "text" / "text.json"; return {**json.loads(j.read_text()), "status": "ready", "v": int(j.stat().st_mtime)}
+    if found(d): j = d / "text" / "text.json"; return {**json.loads(j.read_text()), "status": "ready", "v": int(j.stat().st_mtime), "drop": sorted(dropped(d))}
     if d.name in TEXT_ERR: return {"status": "error", "msg": TEXT_ERR.pop(d.name)}
     def run():
         try: text_layer(d)
@@ -246,8 +266,8 @@ def text_status(d):  # for the viewer: the text's pieces, or "working" while the
     return {"status": "working"}
 
 
-def burn(d, on, W, H, first, pre="null", post="null"):  # the on-video text over a W x H video (when on): (ffmpeg inputs, numbered from first; a filter graph [0:v] -> [v])
-    t = text_layer(d) if on else {"size": [W, H], "fps": 1, "sprites": []}; (w, h), sp = t["size"], t["sprites"]; s = max(W / w, H / h); ox, oy = (w * s - W) / 2, (h * s - H) / 2
+def burn(d, on, W, H, first, pre="null", post="null"):  # the on-video text over a W x H video (when on; only the pieces you kept): (ffmpeg inputs, numbered from first; a filter graph [0:v] -> [v])
+    t = text_layer(d) if on else {"size": [W, H], "fps": 1, "sprites": []}; (w, h), sp = t["size"], [p for p in t["sprites"] if p["png"] not in dropped(d)]; s = max(W / w, H / h); ox, oy = (w * s - W) / 2, (h * s - H) / 2
     g = f"[0:v]{pre}[v0];" + "".join(f"[{first + i}:v]scale=iw*{s:.5f}:-1[s{i}];[v{i}][s{i}]overlay={p['x'] * s - ox:.1f}:{p['y'] * s - oy:.1f}:format=auto:enable='"
                   + "+".join(f"between(t,{a / t['fps']:.4f},{(b + 0.5) / t['fps']:.4f})" for a, b in p["frames"]) + f"'[v{i + 1}];" for i, p in enumerate(sp))
     return sum((["-i", d / "text" / p["png"]] for p in sp), []), g + f"[v{len(sp)}]{post}[v]"
@@ -761,6 +781,7 @@ class H(SimpleHTTPRequestHandler):
         a, route = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}"), self.path
         if route == "/template": threading.Thread(target=prefetch, args=(a["link"].strip(),), daemon=True).start(); return self.reply({"ok": True})
         if route == "/cancel": S.pop("pending", None); state.update(stage="idle", msg=""); return self.reply({"ok": True})
+        if route == "/textdrop" and (t := (TEMPLATES / a["reel"]).parent / "text").is_dir(): (t / "drop.json").write_text(json.dumps([str(p) for p in a["drop"]])); return self.reply({"ok": True})  # a text piece ticked / unticked
         if state["stage"] == "working": return self.reply({"error": "already running"})
         if route == "/keep" and "pending" not in S: return self.reply({"error": "nothing to keep"})
         job = {"/start": lambda: build(a["link"].strip(), Path(a["folder"].strip().strip('"')), int(a["tries"]), float(a["threshold"]),
@@ -871,12 +892,14 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 .v{min-width:0;display:flex;flex-direction:column;align-items:center;gap:5px;padding:6px;border-radius:8px;cursor:pointer;font-size:11px;color:#aaa;user-select:none}
 .v .im{position:relative;width:100%;aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#1b1b1b;border-radius:6px;color:#666} .v img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .v span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .v.on{background:#e67e2240;color:#fff} .v.cur .im{outline:2px solid #f5b041;outline-offset:2px} .v.short{opacity:.3}
-#lv,#sv{flex:1;min-height:0;width:100%;object-fit:contain} #L{position:relative} #ov{position:absolute;pointer-events:none;overflow:hidden} #ov img{position:absolute}
+#lv,#sv{flex:1;min-height:0;width:100%;object-fit:contain} #L{position:relative} #ov{position:absolute;pointer-events:none;overflow:hidden} #ov img{position:absolute} #ov img.hi{outline:2px solid #f5b041;outline-offset:3px}
+#tl{flex:none;width:170px;overflow:auto;display:flex;flex-direction:column;gap:6px;font-size:11px;color:#aaa} #tl b{font-weight:400;color:#777} .tp{display:flex;flex-direction:column;gap:4px;padding:6px;border-radius:8px;background:#1b1b1b;border:1px solid transparent;cursor:pointer}
+.tp:hover{background:#242424} .tp.now{border-color:#e67e22} .tp.off{opacity:.4} .tp img{height:24px;max-width:100%;object-fit:contain;object-position:left;background:#2b2b44;border-radius:4px;padding:4px} .tp div{display:flex;gap:6px;align-items:center} .tp input{accent-color:#e67e22;margin:0}
 </style>
 <div id="bar"><span id="head"></span></div>
 <div id="ctl"><button id="prev">◀ Prev</button><button id="play">Play shot</button><button id="next">Next ▶</button>
 <label><input type="checkbox" id="loop" checked> Loop shot</label><button id="all">Play whole reel</button><button id="rep" hidden>Replace clip</button>
-<button id="export" class="hot" hidden>Save reel</button><button id="capt" hidden title="The template post's caption, to paste under your reel (Save reel also writes it as caption.txt)">Copy caption</button><label id="txl" hidden title="The template's own on-video text: same font, place and timing. Only shows or hides it; Save reel and Make 4K follow this box">
+<button id="export" class="hot" hidden>Save reel</button><button id="capt" hidden title="The template post's caption, to paste under your reel (Save reel also writes it as caption.txt)">Copy caption</button><label id="txl" hidden title="The template's own on-video text: same font, place and timing. Only shows or hides it; Save reel and Make 4K follow this box and the pieces ticked in the list on the right">
 <input type="checkbox" id="tx" checked> <span id="txn">On-video text</span></label>
 <button id="k4" hidden title="From your original videos: plain, AI and AI smooth (60 fps) 4K versions, next to Save reel's files (Mac: ~30-50 min)">Make 4K</button><span id="info"></span></div>
 <div id="edit" hidden><span id="choose"><button data-m="same">Same video</button><button id="slideSame">Slide same video</button><button data-m="random">Random video</button><button class="browse">Choose a video</button>
@@ -886,7 +909,7 @@ figure{margin:0;flex:1;min-width:0;display:flex;flex-direction:column;align-item
 <div id="stage"><figure id="L"><div class="cap" hidden><b>Current</b><span id="lcap"></span><button id="lplay">▶ Play</button><label><input type="checkbox" id="lloop"> Loop</label></div>
   <video id="player" playsinline></video><div id="ov" hidden></div></figure>
   <figure id="R" hidden><div class="cap"><b>New</b><span id="rcap"></span><button id="rplay">▶ Play</button><label><input type="checkbox" id="rloop"> Loop</label></div>
-  <div id="tabs"></div><video id="cand" playsinline></video></figure></div>
+  <div id="tabs"></div><video id="cand" playsinline></video></figure><div id="tl" hidden></div></div>
 <div id="grid" hidden><div id="gbar"><span id="gn"></span><label>Icon size <input type="range" id="gsize" min="120" max="480" step="10"></label>
   <button id="gsel" class="hot" disabled>Select</button><button id="gslide" disabled>Slide</button><button id="gx">Cancel</button><span>Click: highlight · Enter / double-click: select · Space: preview · S: slide</span></div><div id="tiles"></div></div>
 <div id="look" hidden><video id="lv" playsinline controls></video><div id="lbar"><span id="lname"></span><button id="lsel" class="hot">Select</button><button id="lslide">Slide</button><button id="lx">Close</button>
@@ -917,22 +940,31 @@ setInterval(() => {  // a timer, not rAF: rAF stops when the page isn't painted
   $('#lplay').textContent = P.paused ? '▶ Play' : '❚❚ Pause'; $('#rplay').textContent = Q.paused ? '▶ Play' : '❚❚ Pause'; txDraw();
 }, 10);
 // ---- On-video text: the template's text pieces (see-through PNGs) drawn over the player at their frames; the box only shows or hides them
-let TX = null; const txKey = 'text:' + D.template, txOn = () => !!TX && $('#tx').checked;
+let TX = null, drop = new Set(); const txKey = 'text:' + D.template, txOn = () => !!TX && $('#tx').checked;
 function txDraw() {
-  const ov = $('#ov'); if (!txOn()) return ov.hidden = true; ov.hidden = false;
+  const ov = $('#ov'), on = txOn(); $('#tl').hidden = !on; if (!on) return ov.hidden = true; ov.hidden = false;
   const r = P.getBoundingClientRect(), f = $('#L').getBoundingClientRect(), vw = P.videoWidth || 1080, vh = P.videoHeight || 1920, k = Math.min(r.width / vw, r.height / vh);
   Object.assign(ov.style, {left: `${r.left - f.left + (r.width - vw * k) / 2}px`, top: `${r.top - f.top + (r.height - vh * k) / 2}px`, width: `${vw * k}px`, height: `${vh * k}px`});
   const [w, h] = TX.size, s = Math.max(vw / w, vh / h), ox = (w * s - vw) / 2, oy = (h * s - vh) / 2, fr = Math.floor(P.currentTime * TX.fps + 1e-3);  // the reel and the template share frames
-  [...ov.children].forEach((im, i) => { const p = TX.sprites[i]; im.style.display = p.frames.some(([a, b]) => a <= fr && fr <= b) ? '' : 'none';
+  [...ov.children].forEach((im, i) => { const p = TX.sprites[i], now = p.frames.some(([a, b]) => a <= fr && fr <= b); im.style.display = now && !drop.has(p.png) ? '' : 'none'; TX.items[i].classList.toggle('now', now);
     Object.assign(im.style, {left: `${(p.x * s - ox) / vw * 100}%`, top: `${(p.y * s - oy) / vh * 100}%`, width: `${p.w * s / vw * 100}%`}); });
 }
 function txLoad() {  // found once per template, in the background (a minute or two the first time)
   fetch(`/text?reel=${encodeURIComponent(reel)}`).then(r => r.json()).then(t => {
     if (t.status === 'working') { $('#txl').hidden = false; $('#tx').disabled = true; $('#txn').textContent = 'Finding the on-video text…'; return setTimeout(txLoad, 3000); }
     if (!t.sprites?.length) return $('#txl').hidden = true;
-    TX = t; $('#ov').innerHTML = t.sprites.map(p => `<img src="/t/${D.template}/text/${p.png}?v=${t.v}" alt="">`).join('');
+    const src = p => `/t/${D.template}/text/${p.png}?v=${t.v}`, at = f => fmt(f / t.fps); drop = new Set(t.drop); $('#ov').innerHTML = t.sprites.map(p => `<img src="${src(p)}" alt="">`).join('');
+    $('#tl').innerHTML = '<b id="tln"></b>' + t.sprites.map((p, i) => [p.frames[0][0], i]).sort((a, b) => a[0] - b[0]).map(([a, i]) => { const p = t.sprites[i];  // in time order: a picture of the piece, its time, keep it or not
+      return `<div class="tp${drop.has(p.png) ? ' off' : ''}" data-i="${i}" title="Click: go to it · Tick: keep it (Save reel and Make 4K use only the ticked ones)"><img src="${src(p)}" alt="">`
+        + `<div><input type="checkbox"${drop.has(p.png) ? '' : ' checked'}>${at(a)} - ${at(p.frames.at(-1)[1] + 1)}</div></div>`; }).join('');
+    TX = t; t.items = t.sprites.map((p, i) => $(`.tp[data-i="${i}"]`)); tlCount();
     try { $('#tx').checked = localStorage[txKey] !== 'off'; } catch {} $('#tx').disabled = false; $('#txn').textContent = 'On-video text'; $('#txl').hidden = false; });
 }
+const tlCount = () => $('#tln').textContent = `Text pieces · ${TX.sprites.length - drop.size} of ${TX.sprites.length} kept`;
+$('#tl').onclick = e => { const it = e.target.closest('.tp'); if (!it) return; const i = +it.dataset.i, p = TX.sprites[i];
+  if (e.target.type === 'checkbox') { e.target.checked ? drop.delete(p.png) : drop.add(p.png); it.classList.toggle('off', !e.target.checked); tlCount(); return post('/textdrop', {reel, drop: [...drop]}); }
+  const a = p.frames[0][0], im = $('#ov').children[i]; P.pause(); pick(D.shots.findIndex(s => a < s.end_f), false); seek(a);  // its first frame, paused, the piece outlined a moment
+  im.classList.add('hi'); setTimeout(() => im.classList.remove('hi'), 1500); };
 $('#tx').onchange = () => { try { localStorage[txKey] = $('#tx').checked ? 'on' : 'off'; } catch {} };
 function pick(i, play = true) {
   cur = Math.max(0, Math.min(D.shots.length - 1, i)); whole = false; const s = D.shots[cur], c = D.cuts[cur - 1];
